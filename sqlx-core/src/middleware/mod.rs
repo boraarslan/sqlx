@@ -112,14 +112,18 @@
 mod boxed;
 mod executor;
 mod extensions;
+mod from_fn;
+mod info;
 mod request;
 mod response;
 
 #[doc(hidden)]
 pub use boxed::ConnectionService;
-pub use boxed::{into_sqlx_error, BoxCloneService, BoxService, Layers};
+pub use boxed::{into_sqlx_error, BoxService, Layers};
 pub use executor::ServiceExecutor;
 pub use extensions::Extensions;
+pub use from_fn::{from_fn, FromFn, FromFnLayer, Next};
+pub use info::ConnectionInfo;
 pub use request::{Request, RequestKind, RequestParts};
 pub use response::{Response, ResultItem, ResultStream};
 

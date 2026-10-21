@@ -84,6 +84,8 @@ where
             statement: None,
             parameter_types: Vec::new(),
             extensions: parts.extensions,
+            connection_info: parts.connection_info,
+            transaction_depth: parts.transaction_depth,
         });
 
         let response = self.service.call(request);

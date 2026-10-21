@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use crate::database::Database;
 use crate::error::Error;
 use crate::executor::Executor;
-use crate::middleware::{BoxCloneService, Request, Response, ResultItem, ResultStream, Service};
+use crate::middleware::{BoxService, Request, Response, ResultItem, ResultStream, Service};
 use crate::pool::inner::PoolInner;
 use crate::pool::{Pool, PoolConnection};
 
@@ -29,6 +29,9 @@ where
         Box::pin(async move {
             match service(&pool.0) {
                 Some(service) => {
+                    let mut request = request;
+                    request.set_connection_info(pool.0.connection_info());
+
                     let mut service = service.clone();
                     poll_fn(|cx| service.poll_ready(cx)).await?;
                     service.call(request).await
@@ -65,7 +68,7 @@ where
     }
 }
 
-fn service<DB: Database>(pool: &Arc<PoolInner<DB>>) -> Option<&BoxCloneService<DB>>
+fn service<DB: Database>(pool: &Arc<PoolInner<DB>>) -> Option<&BoxService<DB>>
 where
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
 {
@@ -76,7 +79,7 @@ where
             }
 
             // Use a weak reference to avoid a reference cycle through `PoolInner::service`.
-            let inner = BoxCloneService::new(PoolService {
+            let inner = BoxService::new(PoolService {
                 pool: Arc::downgrade(pool),
             });
 

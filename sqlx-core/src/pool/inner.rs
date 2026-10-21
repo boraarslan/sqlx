@@ -3,7 +3,7 @@ use crate::connection::ConnectOptions;
 use crate::connection::Connection;
 use crate::database::Database;
 use crate::error::Error;
-use crate::middleware::BoxCloneService;
+use crate::middleware::{BoxService, ConnectionInfo};
 use crate::pool::{deadline_as_timeout, CloseEvent, Pool, PoolOptions};
 use crossbeam_queue::ArrayQueue;
 
@@ -36,7 +36,9 @@ pub(crate) struct PoolInner<DB: Database> {
     pub(crate) acquire_slow_level: Option<Level>,
     /// The middleware stack built from `options.layers`, initialized on first use.
     /// `None` if there are no layers.
-    pub(super) service: OnceLock<Option<BoxCloneService<DB>>>,
+    pub(super) service: OnceLock<Option<BoxService<DB>>>,
+    /// From `connect_options`, for requests to the pool's middleware.
+    pub(super) connection_info: RwLock<Arc<ConnectionInfo>>,
 }
 
 impl<DB: Database> PoolInner<DB> {
@@ -56,6 +58,7 @@ impl<DB: Database> PoolInner<DB> {
         };
 
         let pool = Self {
+            connection_info: RwLock::new(Arc::new(connect_options.connection_info())),
             connect_options: RwLock::new(Arc::new(connect_options)),
             idle_conns: ArrayQueue::new(capacity),
             semaphore: AsyncSemaphore::new(options.fair, semaphore_capacity),
@@ -74,6 +77,13 @@ impl<DB: Database> PoolInner<DB> {
         spawn_maintenance_tasks(&pool);
 
         pool
+    }
+
+    pub(super) fn connection_info(&self) -> Arc<ConnectionInfo> {
+        self.connection_info
+            .read()
+            .expect("write-lock holder panicked")
+            .clone()
     }
 
     pub(super) fn size(&self) -> u32 {

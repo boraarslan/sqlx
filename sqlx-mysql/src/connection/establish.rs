@@ -10,6 +10,8 @@ use crate::protocol::connect::{
 };
 use crate::protocol::Capabilities;
 use crate::{MySqlConnectOptions, MySqlConnection, MySqlSslMode};
+use sqlx_core::connection::ConnectOptions;
+use std::sync::Arc;
 
 impl MySqlConnection {
     pub(crate) async fn establish(options: &MySqlConnectOptions) -> Result<Self, Error> {
@@ -22,14 +24,17 @@ impl MySqlConnection {
 
         let stream = handshake?;
 
-        Ok(Self::new(MySqlConn {
-            inner: MySqlConnectionInner {
-                stream,
-                status_flags: Default::default(),
-                cache_statement: StatementCache::new(options.statement_cache_capacity),
-                log_settings: options.log_settings.clone(),
+        Ok(Self::new(
+            MySqlConn {
+                inner: MySqlConnectionInner {
+                    stream,
+                    status_flags: Default::default(),
+                    cache_statement: StatementCache::new(options.statement_cache_capacity),
+                    log_settings: options.log_settings.clone(),
+                },
             },
-        }))
+            Arc::new(options.connection_info()),
+        ))
     }
 }
 

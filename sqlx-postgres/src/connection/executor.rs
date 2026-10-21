@@ -494,7 +494,8 @@ impl<'c> Executor<'c> for &'c mut PgConnection {
     where
         'c: 'e,
     {
-        self.service.dispatch(request)
+        let depth = self.transaction_depth();
+        self.service.dispatch(request, depth)
     }
 }
 

@@ -7,6 +7,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::panic::catch_unwind;
 use std::ptr;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use futures_intrusive::sync::MutexGuard;
 use libsqlite3_sys::{
@@ -205,7 +206,11 @@ impl SqliteConnection {
             optimize_on_close: options.optimize_on_close.clone(),
             worker,
             row_channel_size: options.row_channel_size,
-            service: ConnectionService::new(driver, &Layers::new()),
+            service: ConnectionService::new(
+                driver,
+                &Layers::new(),
+                Arc::new(options.connection_info()),
+            ),
         })
     }
 
@@ -216,7 +221,7 @@ impl SqliteConnection {
             row_channel_size: self.row_channel_size,
         };
 
-        self.service = ConnectionService::new(driver, layers);
+        self.service = ConnectionService::new(driver, layers, self.service.info().clone());
     }
 
     /// Lock the SQLite database handle out from the worker thread so direct SQLite API calls can
@@ -248,7 +253,8 @@ impl Service<Request<Sqlite>> for SqliteConnection {
 
     #[inline]
     fn call(&mut self, request: Request<Sqlite>) -> Self::Future {
-        self.service.call(request)
+        let depth = self.worker.shared.get_transaction_depth();
+        self.service.call(request, depth)
     }
 }
 

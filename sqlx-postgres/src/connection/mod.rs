@@ -7,7 +7,9 @@ use std::task::{Context, Poll};
 
 use async_lock::{Mutex, MutexGuardArc};
 use futures_core::future::BoxFuture;
-use sqlx_core::middleware::{BoxService, ConnectionService, Layers, Request, Response, Service};
+use sqlx_core::middleware::{
+    BoxService, ConnectionInfo, ConnectionService, Layers, Request, Response, Service,
+};
 use sqlx_core::sql_str::SqlStr;
 use sqlx_core::transaction::rollback_ansi_transaction_sql;
 
@@ -126,7 +128,11 @@ pub(crate) struct TableData {
 }
 
 impl PgConnection {
-    pub(crate) fn new(conn: PgConn, layers: &Layers<BoxService<Postgres>>) -> Self {
+    pub(crate) fn new(
+        conn: PgConn,
+        layers: &Layers<BoxService<Postgres>>,
+        info: Arc<ConnectionInfo>,
+    ) -> Self {
         let state = Arc::new(PgConnectionState {
             transaction_depth: AtomicUsize::new(0),
             pending_queries: Default::default(),
@@ -143,7 +149,7 @@ impl PgConnection {
         Self {
             conn,
             state,
-            service: ConnectionService::new(driver, layers),
+            service: ConnectionService::new(driver, layers, info),
         }
     }
 
@@ -349,7 +355,8 @@ impl Service<Request<Postgres>> for PgConnection {
 
     #[inline]
     fn call(&mut self, request: Request<Postgres>) -> Self::Future {
-        self.service.call(request)
+        let depth = self.transaction_depth();
+        self.service.call(request, depth)
     }
 }
 

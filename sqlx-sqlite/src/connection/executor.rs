@@ -15,6 +15,7 @@ impl<'c> Executor<'c> for &'c mut SqliteConnection {
     where
         'c: 'e,
     {
-        self.service.dispatch(request)
+        let depth = self.worker.shared.get_transaction_depth();
+        self.service.dispatch(request, depth)
     }
 }

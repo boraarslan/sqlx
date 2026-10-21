@@ -1,5 +1,6 @@
 use futures_core::future::BoxFuture;
 use std::future::Future;
+use std::sync::Arc;
 
 use crate::any::{Any, AnyConnectOptions};
 use crate::connection::{ConnectOptions, Connection};
@@ -76,6 +77,7 @@ impl AnyConnection {
     {
         let res = TryFrom::try_from(options);
         let layers = options.layers.clone();
+        let info = Arc::new(options.connection_info());
 
         Box::pin(async move {
             let mut options: <DB::Connection as Connection>::Options = res?;
@@ -85,7 +87,7 @@ impl AnyConnection {
             }
 
             let mut backend: Box<dyn AnyConnectionBackend> = Box::new(options.connect().await?);
-            let service = ConnectionService::new(backend.service(), &layers);
+            let service = ConnectionService::new(backend.service(), &layers, info);
 
             Ok(AnyConnection { backend, service })
         })
@@ -173,6 +175,7 @@ impl Service<Request<Any>> for AnyConnection {
 
     #[inline]
     fn call(&mut self, request: Request<Any>) -> Self::Future {
-        self.service.call(request)
+        let depth = self.backend.get_transaction_depth();
+        self.service.call(request, depth)
     }
 }

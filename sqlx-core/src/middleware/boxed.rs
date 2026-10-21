@@ -1,15 +1,18 @@
 use std::any::Any;
 use std::fmt::{self, Debug, Formatter};
-use std::future::poll_fn;
+use std::future::{self, poll_fn, Future};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 
+use async_lock::futures::LockArc;
+use async_lock::{Mutex, MutexGuardArc};
 use futures_core::future::BoxFuture;
 use sync_wrapper::SyncWrapper;
 
 use crate::database::Database;
 use crate::error::{BoxDynError, Error};
-use crate::middleware::{Layer, Request, Response, Service};
+use crate::middleware::{ConnectionInfo, Layer, Request, Response, Service};
 
 /// Convert an error returned by middleware into [`Error`].
 ///
@@ -66,16 +69,31 @@ where
     }
 }
 
-/// A type-erased middleware stack.
+/// A type-erased middleware service.
 ///
-/// Used as the inner service of layers added with [`ConnectOptions::layer()`]
-/// and as the type-erased result of applying them.
+/// Used as the inner service of layers added with [`ConnectOptions::layer()`] and
+/// [`PoolOptions::layer()`], and as the type-erased result of applying them.
 ///
-/// This is `Send + Sync`, but the wrapped service only needs to be `Send`.
+/// `BoxService` is `Clone + Send + Sync`, but the wrapped service only needs to be `Send`:
+/// clones share the same instance of the wrapped service, so stateful middleware (like a rate
+/// limit) applies to all clones. This allows using middleware which needs to clone its inner
+/// service, like `tower::retry::Retry`.
+///
+/// The shared instance is locked from when [`poll_ready()`][Service::poll_ready] returns
+/// `Ready` until [`call()`][Service::call] returns the response future. This lock is uncontended
+/// unless clones are used concurrently.
 ///
 /// [`ConnectOptions::layer()`]: crate::connection::ConnectOptions::layer
+/// [`PoolOptions::layer()`]: crate::pool::PoolOptions::layer
 pub struct BoxService<DB: Database> {
-    inner: SyncWrapper<Box<dyn ErasedService<DB>>>,
+    shared: Arc<Mutex<Box<dyn ErasedService<DB>>>>,
+    state: SyncWrapper<State<DB>>,
+}
+
+enum State<DB: Database> {
+    Idle,
+    Locking(Pin<Box<LockArc<Box<dyn ErasedService<DB>>>>>),
+    Locked(MutexGuardArc<Box<dyn ErasedService<DB>>>),
 }
 
 impl<DB: Database> BoxService<DB> {
@@ -89,7 +107,18 @@ impl<DB: Database> BoxService<DB> {
         S::Future: Send + 'static,
     {
         Self {
-            inner: SyncWrapper::new(Box::new(service)),
+            shared: Arc::new(Mutex::new(Box::new(service))),
+            state: SyncWrapper::new(State::Idle),
+        }
+    }
+}
+
+impl<DB: Database> Clone for BoxService<DB> {
+    /// Create another handle to the same service. The new handle is not ready.
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            state: SyncWrapper::new(State::Idle),
         }
     }
 }
@@ -99,92 +128,49 @@ impl<DB: Database> Service<Request<DB>> for BoxService<DB> {
     type Error = Error;
     type Future = BoxFuture<'static, Result<Response<DB>, Error>>;
 
-    #[inline]
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.get_mut().erased_poll_ready(cx)
+        let state = self.state.get_mut();
+
+        loop {
+            match state {
+                State::Idle => {
+                    *state = match self.shared.try_lock_arc() {
+                        Some(guard) => State::Locked(guard),
+                        None => State::Locking(Box::pin(self.shared.lock_arc())),
+                    };
+                }
+                State::Locking(lock) => {
+                    let guard = ready!(lock.as_mut().poll(cx));
+                    *state = State::Locked(guard);
+                }
+                State::Locked(service) => {
+                    let res = ready!(service.erased_poll_ready(cx));
+
+                    if res.is_err() {
+                        // Unlock the service.
+                        *state = State::Idle;
+                    }
+
+                    return Poll::Ready(res);
+                }
+            }
+        }
     }
 
-    #[inline]
     fn call(&mut self, request: Request<DB>) -> Self::Future {
-        self.inner.get_mut().erased_call(request)
+        match std::mem::replace(self.state.get_mut(), State::Idle) {
+            // The service is unlocked as soon as it returns the response future.
+            State::Locked(mut service) => service.erased_call(request),
+            _ => Box::pin(future::ready(Err(Error::Middleware(
+                "BUG: `BoxService::call()` invoked before `poll_ready()` returned `Ready`".into(),
+            )))),
+        }
     }
 }
 
 impl<DB: Database> Debug for BoxService<DB> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("BoxService").finish_non_exhaustive()
-    }
-}
-
-trait ErasedCloneService<DB: Database>: ErasedService<DB> + Sync {
-    fn clone_box(&self) -> Box<dyn ErasedCloneService<DB>>;
-}
-
-impl<DB, S> ErasedCloneService<DB> for S
-where
-    DB: Database,
-    S: Service<Request<DB>, Response = Response<DB>> + Clone + Send + Sync + 'static,
-    S::Error: Into<BoxDynError> + 'static,
-    S::Future: Send + 'static,
-{
-    fn clone_box(&self) -> Box<dyn ErasedCloneService<DB>> {
-        Box::new(self.clone())
-    }
-}
-
-/// A type-erased middleware stack which can be cloned and shared between threads.
-///
-/// Used as the inner service of layers added with [`PoolOptions::layer()`],
-/// and as the type-erased result of applying them.
-///
-/// [`PoolOptions::layer()`]: crate::pool::PoolOptions::layer
-pub struct BoxCloneService<DB: Database> {
-    inner: Box<dyn ErasedCloneService<DB>>,
-}
-
-impl<DB: Database> BoxCloneService<DB> {
-    /// Erase the type of `service`.
-    ///
-    /// Errors returned by the service are converted with [`into_sqlx_error()`].
-    pub fn new<S>(service: S) -> Self
-    where
-        S: Service<Request<DB>, Response = Response<DB>> + Clone + Send + Sync + 'static,
-        S::Error: Into<BoxDynError> + 'static,
-        S::Future: Send + 'static,
-    {
-        Self {
-            inner: Box::new(service),
-        }
-    }
-}
-
-impl<DB: Database> Clone for BoxCloneService<DB> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone_box(),
-        }
-    }
-}
-
-impl<DB: Database> Service<Request<DB>> for BoxCloneService<DB> {
-    type Response = Response<DB>;
-    type Error = Error;
-    type Future = BoxFuture<'static, Result<Response<DB>, Error>>;
-
-    #[inline]
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.erased_poll_ready(cx)
-    }
-
-    #[inline]
-    fn call(&mut self, request: Request<DB>) -> Self::Future {
-        self.inner.erased_call(request)
-    }
-}
-
-impl<DB: Database> Debug for BoxCloneService<DB> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BoxCloneService").finish_non_exhaustive()
     }
 }
 
@@ -250,19 +236,6 @@ impl<DB: Database> Layers<BoxService<DB>> {
     }
 }
 
-impl<DB: Database> Layers<BoxCloneService<DB>> {
-    /// Add a [`Layer`], which will be applied inside all previously added layers.
-    pub fn push<L>(&mut self, layer: L)
-    where
-        L: Layer<BoxCloneService<DB>> + Send + Sync + 'static,
-        L::Service: Service<Request<DB>, Response = Response<DB>> + Clone + Send + Sync + 'static,
-        <L::Service as Service<Request<DB>>>::Error: Into<BoxDynError> + 'static,
-        <L::Service as Service<Request<DB>>>::Future: Send + 'static,
-    {
-        self.push_fn(move |inner| BoxCloneService::new(layer.layer(inner)));
-    }
-}
-
 impl<S> Default for Layers<S> {
     fn default() -> Self {
         Self::new()
@@ -291,9 +264,12 @@ impl<S> Debug for Layers<S> {
 /// If no layers were configured, requests are sent to it directly, without type erasure.
 ///
 /// The driver service is expected to always be ready (its `poll_ready()` is not called).
+///
+/// Before a request enters the stack, its [`ConnectionInfo`] and transaction depth are set.
 #[doc(hidden)]
 pub struct ConnectionService<DB: Database, D> {
     stack: Stack<DB, D>,
+    info: Arc<ConnectionInfo>,
 }
 
 enum Stack<DB: Database, D> {
@@ -313,18 +289,24 @@ where
         + 'static,
 {
     /// Wrap the driver service in `layers`.
-    pub fn new(driver: D, layers: &Layers<BoxService<DB>>) -> Self {
+    pub fn new(driver: D, layers: &Layers<BoxService<DB>>, info: Arc<ConnectionInfo>) -> Self {
         let stack = if layers.is_empty() {
             Stack::Driver(driver)
         } else {
             Stack::Layered(layers.apply(BoxService::new(driver)))
         };
 
-        Self { stack }
+        Self { stack, info }
     }
 
     /// Wait until the stack is ready, then send it `request`.
-    pub fn dispatch(&mut self, request: Request<DB>) -> BoxFuture<'_, Result<Response<DB>, Error>> {
+    pub fn dispatch(
+        &mut self,
+        mut request: Request<DB>,
+        transaction_depth: usize,
+    ) -> BoxFuture<'_, Result<Response<DB>, Error>> {
+        self.prepare(&mut request, transaction_depth);
+
         match &mut self.stack {
             // The driver service is always ready, so we can skip the extra allocation.
             Stack::Driver(driver) => driver.call(request),
@@ -335,41 +317,44 @@ where
         }
     }
 
-    /// Returns `true` if any layers were configured.
-    pub fn is_layered(&self) -> bool {
-        matches!(self.stack, Stack::Layered(_))
-    }
-}
-
-impl<DB, D> Service<Request<DB>> for ConnectionService<DB, D>
-where
-    DB: Database,
-    D: Service<
-            Request<DB>,
-            Response = Response<DB>,
-            Error = Error,
-            Future = BoxFuture<'static, Result<Response<DB>, Error>>,
-        > + Send
-        + 'static,
-{
-    type Response = Response<DB>;
-    type Error = Error;
-    type Future = BoxFuture<'static, Result<Response<DB>, Error>>;
-
+    /// See [`Service::poll_ready()`].
     #[inline]
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         match &mut self.stack {
             Stack::Driver(driver) => driver.poll_ready(cx),
             Stack::Layered(service) => service.poll_ready(cx),
         }
     }
 
+    /// See [`Service::call()`].
     #[inline]
-    fn call(&mut self, request: Request<DB>) -> Self::Future {
+    pub fn call(
+        &mut self,
+        mut request: Request<DB>,
+        transaction_depth: usize,
+    ) -> BoxFuture<'static, Result<Response<DB>, Error>> {
+        self.prepare(&mut request, transaction_depth);
+
         match &mut self.stack {
             Stack::Driver(driver) => driver.call(request),
             Stack::Layered(service) => service.call(request),
         }
+    }
+
+    /// The information about the database this connection is connected to.
+    pub fn info(&self) -> &Arc<ConnectionInfo> {
+        &self.info
+    }
+
+    /// Returns `true` if any layers were configured.
+    pub fn is_layered(&self) -> bool {
+        matches!(self.stack, Stack::Layered(_))
+    }
+
+    #[inline]
+    fn prepare(&self, request: &mut Request<DB>, transaction_depth: usize) {
+        request.set_connection_info(self.info.clone());
+        request.set_transaction_depth(transaction_depth);
     }
 }
 
@@ -377,6 +362,7 @@ impl<DB: Database, D> Debug for ConnectionService<DB, D> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectionService")
             .field("layered", &matches!(self.stack, Stack::Layered(_)))
+            .field("info", &self.info)
             .finish_non_exhaustive()
     }
 }

@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::executor::Executor;
 use crate::{MySql, MySqlConnectOptions, MySqlConnection};
 use log::LevelFilter;
-use sqlx_core::middleware::{BoxService, Layers};
+use sqlx_core::middleware::{BoxService, ConnectionInfo, Layers};
 use sqlx_core::sql_str::AssertSqlSafe;
 use sqlx_core::Url;
 use std::time::Duration;
@@ -110,5 +110,20 @@ impl ConnectOptions for MySqlConnectOptions {
 
     fn layers_mut(&mut self) -> &mut Layers<BoxService<MySql>> {
         &mut self.layers
+    }
+
+    fn connection_info(&self) -> ConnectionInfo {
+        let mut info = ConnectionInfo::new().with_user(&self.username);
+
+        if let Some(database) = &self.database {
+            info = info.with_database(database);
+        }
+
+        match &self.socket {
+            Some(socket) => info.with_server_address(socket.to_string_lossy()),
+            None => info
+                .with_server_address(&self.host)
+                .with_server_port(self.port),
+        }
     }
 }

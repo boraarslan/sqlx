@@ -8,7 +8,9 @@ use async_lock::{Mutex, MutexGuardArc};
 use futures_core::future::BoxFuture;
 pub(crate) use service::MySqlDriver;
 pub(crate) use sqlx_core::connection::*;
-use sqlx_core::middleware::{BoxService, ConnectionService, Layers, Request, Response, Service};
+use sqlx_core::middleware::{
+    BoxService, ConnectionInfo, ConnectionService, Layers, Request, Response, Service,
+};
 use sqlx_core::sql_str::{SqlSafeStr, SqlStr};
 use sqlx_core::transaction::rollback_ansi_transaction_sql;
 pub(crate) use stream::{MySqlStream, Waiting};
@@ -89,7 +91,7 @@ pub(crate) struct MySqlConnectionInner {
 }
 
 impl MySqlConnection {
-    pub(crate) fn new(conn: MySqlConn) -> Self {
+    pub(crate) fn new(conn: MySqlConn, info: Arc<ConnectionInfo>) -> Self {
         let state = Arc::new(MySqlConnectionState {
             transaction_depth: AtomicUsize::new(0),
             pending_rollbacks: Default::default(),
@@ -107,7 +109,7 @@ impl MySqlConnection {
         Self {
             conn,
             state,
-            service: ConnectionService::new(driver, &Layers::new()),
+            service: ConnectionService::new(driver, &Layers::new(), info),
         }
     }
 
@@ -118,7 +120,7 @@ impl MySqlConnection {
             state: self.state.clone(),
         };
 
-        self.service = ConnectionService::new(driver, layers);
+        self.service = ConnectionService::new(driver, layers, self.service.info().clone());
     }
 
     /// Lock the protocol state of the connection, bypassing middleware.
@@ -239,7 +241,8 @@ impl Service<Request<MySql>> for MySqlConnection {
 
     #[inline]
     fn call(&mut self, request: Request<MySql>) -> Self::Future {
-        self.service.call(request)
+        let depth = self.transaction_depth();
+        self.service.call(request, depth)
     }
 }
 

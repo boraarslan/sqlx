@@ -1,10 +1,11 @@
 use std::fmt::{self, Debug, Formatter};
+use std::sync::Arc;
 
 use crate::arguments::Arguments;
 use crate::database::Database;
 use crate::error::{BoxDynError, Error};
 use crate::executor::Execute;
-use crate::middleware::Extensions;
+use crate::middleware::{ConnectionInfo, Extensions};
 use crate::sql_str::{SqlSafeStr, SqlStr};
 use crate::transaction::{
     begin_ansi_transaction_sql, commit_ansi_transaction_sql, rollback_ansi_transaction_sql,
@@ -102,6 +103,8 @@ pub struct Request<DB: Database> {
     statement: Option<DB::Statement>,
     parameter_types: Vec<DB::TypeInfo>,
     extensions: Extensions,
+    connection_info: Option<Arc<ConnectionInfo>>,
+    transaction_depth: usize,
 }
 
 /// The constituent parts of a [`Request`], for drivers and advanced middleware.
@@ -123,6 +126,10 @@ pub struct RequestParts<DB: Database> {
     pub parameter_types: Vec<DB::TypeInfo>,
     /// See [`Request::extensions()`].
     pub extensions: Extensions,
+    /// See [`Request::connection_info()`].
+    pub connection_info: Option<Arc<ConnectionInfo>>,
+    /// See [`Request::transaction_depth()`].
+    pub transaction_depth: usize,
 }
 
 impl<DB: Database> Request<DB> {
@@ -139,6 +146,8 @@ impl<DB: Database> Request<DB> {
             statement: None,
             parameter_types: Vec::new(),
             extensions: Extensions::new(),
+            connection_info: None,
+            transaction_depth: 0,
         }
     }
 
@@ -205,6 +214,8 @@ impl<DB: Database> Request<DB> {
             statement,
             parameter_types: Vec::new(),
             extensions,
+            connection_info: None,
+            transaction_depth: 0,
         })
     }
 
@@ -310,6 +321,54 @@ impl<DB: Database> Request<DB> {
         &mut self.extensions
     }
 
+    /// Information about the database the request is sent to, from the connect options of the
+    /// connection or pool.
+    ///
+    /// This is set by the connection (or pool) the request is sent to, before it enters the
+    /// middleware stack. It is `None` for requests which were not (yet) sent through a connection
+    /// or pool.
+    #[inline]
+    pub fn connection_info(&self) -> Option<&ConnectionInfo> {
+        self.connection_info.as_deref()
+    }
+
+    /// Set the information about the database the request is sent to.
+    ///
+    /// Called by connections and pools; this is not normally needed otherwise.
+    #[doc(hidden)]
+    #[inline]
+    pub fn set_connection_info(&mut self, connection_info: Arc<ConnectionInfo>) {
+        self.connection_info = Some(connection_info);
+    }
+
+    /// The transaction depth of the connection when the request was made: `0` if not in a
+    /// transaction, `1` in a transaction, and `2` or more within savepoints.
+    ///
+    /// For example, middleware which retries failed queries should not retry
+    /// within a transaction, as the failure likely aborted the transaction.
+    ///
+    /// Requests sent through a [`Pool`][crate::pool::Pool] are never in a transaction
+    /// when they enter the pool's middleware stack.
+    #[inline]
+    pub fn transaction_depth(&self) -> usize {
+        self.transaction_depth
+    }
+
+    /// Returns `true` if [`transaction_depth()`][Self::transaction_depth] is nonzero.
+    #[inline]
+    pub fn in_transaction(&self) -> bool {
+        self.transaction_depth != 0
+    }
+
+    /// Set the transaction depth of the connection the request is sent to.
+    ///
+    /// Called by connections; this is not normally needed otherwise.
+    #[doc(hidden)]
+    #[inline]
+    pub fn set_transaction_depth(&mut self, transaction_depth: usize) {
+        self.transaction_depth = transaction_depth;
+    }
+
     /// Deconstruct the request into its parts.
     pub fn into_parts(self) -> RequestParts<DB> {
         RequestParts {
@@ -320,6 +379,8 @@ impl<DB: Database> Request<DB> {
             statement: self.statement,
             parameter_types: self.parameter_types,
             extensions: self.extensions,
+            connection_info: self.connection_info,
+            transaction_depth: self.transaction_depth,
         }
     }
 
@@ -333,6 +394,8 @@ impl<DB: Database> Request<DB> {
             statement: parts.statement,
             parameter_types: parts.parameter_types,
             extensions: parts.extensions,
+            connection_info: parts.connection_info,
+            transaction_depth: parts.transaction_depth,
         }
     }
 }
@@ -350,6 +413,8 @@ where
             statement: self.statement.clone(),
             parameter_types: self.parameter_types.clone(),
             extensions: self.extensions.clone(),
+            connection_info: self.connection_info.clone(),
+            transaction_depth: self.transaction_depth,
         }
     }
 }
@@ -364,6 +429,8 @@ impl<DB: Database> Debug for Request<DB> {
             .field("statement", &self.statement.is_some())
             .field("parameter_types", &self.parameter_types)
             .field("extensions", &self.extensions)
+            .field("connection_info", &self.connection_info)
+            .field("transaction_depth", &self.transaction_depth)
             .finish()
     }
 }

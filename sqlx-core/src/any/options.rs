@@ -1,7 +1,7 @@
 use crate::any::{Any, AnyConnection};
 use crate::connection::{ConnectOptions, LogSettings};
 use crate::error::Error;
-use crate::middleware::{BoxService, Layers};
+use crate::middleware::{BoxService, ConnectionInfo, Layers};
 use log::LevelFilter;
 use std::future::Future;
 use std::str::FromStr;
@@ -73,6 +73,31 @@ impl ConnectOptions for AnyConnectOptions {
 
     fn layers_mut(&mut self) -> &mut Layers<BoxService<Any>> {
         &mut self.layers
+    }
+
+    fn connection_info(&self) -> ConnectionInfo {
+        let url = &self.database_url;
+        let mut info = ConnectionInfo::new();
+
+        let database = url.path().trim_start_matches('/');
+
+        if !database.is_empty() {
+            info = info.with_database(database);
+        }
+
+        if let Some(host) = url.host_str().filter(|host| !host.is_empty()) {
+            info = info.with_server_address(host);
+        }
+
+        if let Some(port) = url.port() {
+            info = info.with_server_port(port);
+        }
+
+        if !url.username().is_empty() {
+            info = info.with_user(url.username());
+        }
+
+        info
     }
 }
 

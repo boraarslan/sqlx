@@ -8,6 +8,8 @@ use crate::message::{
     Authentication, BackendKeyData, BackendMessageFormat, Password, ReadyForQuery, Startup,
 };
 use crate::{PgConnectOptions, PgConnection};
+use sqlx_core::connection::ConnectOptions;
+use std::sync::Arc;
 
 use super::{PgConn, PgConnectionInner};
 
@@ -152,6 +154,10 @@ impl PgConnection {
             },
         };
 
-        Ok(PgConnection::new(conn, &options.layers))
+        Ok(PgConnection::new(
+            conn,
+            &options.layers,
+            Arc::new(options.connection_info()),
+        ))
     }
 }

@@ -3,7 +3,7 @@ use crate::error::Error;
 
 use crate::config;
 use crate::error::BoxDynError;
-use crate::middleware::{BoxService, Layer, Layers, Request, Response, Service};
+use crate::middleware::{BoxService, ConnectionInfo, Layer, Layers, Request, Response, Service};
 use crate::sql_str::SqlSafeStr;
 use crate::transaction::{Transaction, TransactionManager};
 use futures_core::future::BoxFuture;
@@ -311,6 +311,14 @@ pub trait ConnectOptions: 'static + Send + Sync + FromStr<Err = Error> + Debug +
 
     /// The middleware layers added with [`layer()`][Self::layer].
     fn layers(&self) -> &Layers<BoxService<<Self::Connection as Connection>::Database>>;
+
+    /// Information about the database these options connect to,
+    /// as provided to middleware by [`Request::connection_info()`].
+    ///
+    /// This never contains credentials.
+    fn connection_info(&self) -> ConnectionInfo {
+        ConnectionInfo::default()
+    }
 
     /// A mutable reference to the middleware layers added with [`layer()`][Self::layer].
     fn layers_mut(&mut self)

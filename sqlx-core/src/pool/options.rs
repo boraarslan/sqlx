@@ -1,7 +1,7 @@
 use crate::connection::Connection;
 use crate::database::Database;
 use crate::error::{BoxDynError, Error};
-use crate::middleware::{BoxCloneService, Layer, Layers, Request, Response, Service};
+use crate::middleware::{BoxService, Layer, Layers, Request, Response, Service};
 use crate::pool::inner::PoolInner;
 use crate::pool::Pool;
 use futures_core::future::BoxFuture;
@@ -87,7 +87,7 @@ pub struct PoolOptions<DB: Database> {
 
     pub(crate) parent_pool: Option<Pool<DB>>,
 
-    pub(crate) layers: Layers<BoxCloneService<DB>>,
+    pub(crate) layers: Layers<BoxService<DB>>,
 }
 
 // Manually implement `Clone` to avoid a trait bound issue.
@@ -516,9 +516,10 @@ impl<DB: Database> PoolOptions<DB> {
     /// connection, add a layer to the connect options instead with
     /// [`ConnectOptions::layer()`][crate::connection::ConnectOptions::layer].
     ///
-    /// The stack is shared by all users of the pool and cloned for each request,
-    /// so the service produced by the layer must be `Clone + Send + Sync`.
-    /// Stateful middleware should share their state between clones, e.g. through an `Arc`.
+    /// The stack is shared by all users of the pool: there is one instance of each middleware
+    /// service, used by all requests through the pool. The instance is locked for the
+    /// (short) time between a request's call to `poll_ready()` and `call()`;
+    /// see [`BoxService`] for details.
     ///
     /// Layers are applied like `tower::ServiceBuilder`: the first layer added is the outermost
     /// and sees each request first.
@@ -529,8 +530,8 @@ impl<DB: Database> PoolOptions<DB> {
     /// [`Executor`]: crate::executor::Executor
     pub fn layer<L>(mut self, layer: L) -> Self
     where
-        L: Layer<BoxCloneService<DB>> + Send + Sync + 'static,
-        L::Service: Service<Request<DB>, Response = Response<DB>> + Clone + Send + Sync + 'static,
+        L: Layer<BoxService<DB>> + Send + Sync + 'static,
+        L::Service: Service<Request<DB>, Response = Response<DB>> + Send + 'static,
         <L::Service as Service<Request<DB>>>::Error: Into<BoxDynError> + 'static,
         <L::Service as Service<Request<DB>>>::Future: Send + 'static,
     {

@@ -12,6 +12,7 @@ impl<'c> Executor<'c> for &'c mut AnyConnection {
     where
         'c: 'e,
     {
-        self.service.dispatch(request)
+        let depth = self.backend.get_transaction_depth();
+        self.service.dispatch(request, depth)
     }
 }
