@@ -116,6 +116,7 @@ mod from_fn;
 mod info;
 mod request;
 mod response;
+pub mod trace;
 
 #[doc(hidden)]
 pub use boxed::ConnectionService;

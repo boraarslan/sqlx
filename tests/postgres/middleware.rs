@@ -700,3 +700,116 @@ fn layers_are_type_erased() {
 }
 
 use sqlx::{PgConnection, SqlSafeStr};
+
+mod span_capture {
+    use std::collections::BTreeMap;
+    use std::fmt::Debug;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::Subscriber;
+    use tracing_subscriber::layer::Context;
+    use tracing_subscriber::registry::LookupSpan;
+
+    pub type Fields = BTreeMap<String, String>;
+
+    /// Records the fields of every span when it is closed.
+    #[derive(Clone, Default)]
+    pub struct SpanCapture(pub Arc<Mutex<Vec<(&'static str, Fields)>>>);
+
+    struct Visitor<'a>(&'a mut Fields);
+
+    impl Visit for Visitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+            self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().into(), value.into());
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SpanCapture
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+            let mut fields = Fields::new();
+            attrs.record(&mut Visitor(&mut fields));
+            ctx.span(id).unwrap().extensions_mut().insert(fields);
+        }
+
+        fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+            let span = ctx.span(id).unwrap();
+            let mut extensions = span.extensions_mut();
+            values.record(&mut Visitor(extensions.get_mut::<Fields>().unwrap()));
+        }
+
+        fn on_close(&self, id: Id, ctx: Context<'_, S>) {
+            let span = ctx.span(&id).unwrap();
+            let fields = span.extensions_mut().remove::<Fields>().unwrap();
+            self.0.lock().unwrap().push((span.name(), fields));
+        }
+    }
+}
+
+#[sqlx_macros::test]
+async fn it_traces_requests_with_otel_conventions() -> anyhow::Result<()> {
+    use sqlx::middleware::trace::{QuerySummary, TraceLayer};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let capture = span_capture::SpanCapture::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+
+    let options = connect_options()?;
+    let mut conn = PgConnection::connect_with(&options.clone().layer(TraceLayer::new())).await?;
+
+    let rows = sqlx::query("SELECT generate_series(1, 3)")
+        .extension(QuerySummary::new("SELECT series"))
+        .fetch_all(&mut conn)
+        .await?;
+    assert_eq!(rows.len(), 3);
+
+    // Partially consume a stream, then drop it.
+    {
+        let mut stream = sqlx::query("SELECT generate_series(1, 10)").fetch(&mut conn);
+        stream.next().await.unwrap()?;
+        stream.next().await.unwrap()?;
+    }
+
+    conn.execute("SELECT * FROM").await.unwrap_err();
+
+    let spans = std::mem::take(&mut *capture.0.lock().unwrap());
+    assert_eq!(spans.len(), 3, "{spans:#?}");
+
+    let (name, fields) = &spans[0];
+    assert_eq!(*name, "sqlx.query");
+    assert_eq!(fields["otel.name"], "SELECT series");
+    assert_eq!(fields["otel.kind"], "client");
+    assert_eq!(fields["db.system.name"], "postgresql");
+    assert_eq!(fields["db.query.text"], "SELECT generate_series(1, 3)");
+    assert_eq!(fields["db.query.summary"], "SELECT series");
+    assert_eq!(fields["db.response.returned_rows"], "3");
+    assert_eq!(fields["sqlx.request.kind"], "fetch");
+    assert_eq!(
+        fields.get("db.namespace").map(String::as_str),
+        options.get_database()
+    );
+    assert_eq!(fields["server.address"], options.get_host());
+    assert_eq!(fields["server.port"], options.get_port().to_string());
+    assert!(!fields.contains_key("error.type"));
+
+    let (_, fields) = &spans[1];
+    assert_eq!(fields["otel.name"], "postgresql");
+    assert_eq!(fields["db.response.returned_rows"], "2");
+
+    let (_, fields) = &spans[2];
+    assert_eq!(fields["db.query.text"], "SELECT * FROM");
+    assert_eq!(fields["otel.status_code"], "ERROR");
+    assert_eq!(fields["error.type"], "42601");
+    assert_eq!(fields["db.response.status_code"], "42601");
+
+    Ok(())
+}
