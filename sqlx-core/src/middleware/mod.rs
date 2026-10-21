@@ -14,11 +14,43 @@
 //!   pass through the layer, whether they come from `&mut Connection`, a [`PoolConnection`], a
 //!   [`Transaction`] or a `Pool` executor. Each connection gets its own instance of the stack.
 //! * **Pools**: [`PoolOptions::layer()`] adds a layer that sees queries executed directly on a
-//!   `&Pool`, *before* a connection is acquired. The time spent waiting for a connection is part
-//!   of the request. The stack is shared and cloned per request, so its services must be `Clone`.
+//!   `&Pool`, *before* a connection is acquired, so the time spent waiting for a connection is
+//!   part of the request. There is one instance of the stack, shared by all users of the pool.
 //! * **Ad-hoc executors**: connections, transactions and pools implement
 //!   `Service<Request<DB>>`, so any of them can be wrapped in layers, e.g. with
 //!   `tower::ServiceBuilder`, and turned back into an [`Executor`] with [`ServiceExecutor`].
+//!
+//! Layers are applied like `tower::ServiceBuilder`: the first layer added is the outermost
+//! and sees each request first.
+//!
+//! # Writing Middleware
+//! The easiest way to write middleware is [`from_fn()`], which takes an async function or
+//! closure receiving each [`Request`] and a [`Next`] to pass it on:
+//!
+//! ```rust,no_run
+//! use sqlx::middleware::{self, Next, Request};
+//! use sqlx::postgres::{PgConnectOptions, PgPoolOptions, Postgres};
+//!
+//! # async fn example() -> sqlx::Result<()> {
+//! let options: PgConnectOptions = "postgres://localhost/mydb".parse()?;
+//!
+//! let pool = PgPoolOptions::new()
+//!     .connect_with(options.layer(middleware::from_fn(
+//!         |request: Request<Postgres>, next: Next<Postgres>| async move {
+//!             if request.sql().as_str().contains("DROP") {
+//!                 return Err(sqlx::Error::InvalidArgument("not allowed".into()));
+//!             }
+//!
+//!             next.run(request).await
+//!         },
+//!     )))
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Middleware can also be written like any other Tower middleware, by implementing
+//! [`Layer`] and [`Service`] (see the example at the end of this page).
 //!
 //! # Requests and Responses
 //! A [`Request`] owns its SQL, bind arguments and [`Extensions`], and its [`RequestKind`]
@@ -30,18 +62,68 @@
 //! | `Prepare` | `Statement` |
 //! | `Begin`, `Commit`, `Rollback` | `Done` |
 //!
+//! Before a request enters the stack of a connection or pool, the connection sets its
+//! [`ConnectionInfo`] (database name, server address, ...) and
+//! [transaction depth][Request::transaction_depth]. Values can be attached to requests with
+//! [`Query::extension()`][crate::query::Query::extension] or by middleware, through
+//! [`Request::extensions_mut()`].
+//!
+//! Middleware may change the request, for example to rewrite its SQL (e.g. to add a comment
+//! with trace context; note that a different SQL string is a different prepared statement, so
+//! comments which change with every query defeat the statement cache), or return a response
+//! without passing the request on.
+//!
+//! ## Streaming
 //! The future returned by a service completes once the database has started responding
 //! (the first row or result was received, or an error). The rest of the rows
 //! are streamed through the [`ResultStream`], which is `'static` and keeps the connection reserved
-//! until it is exhausted or dropped. Middleware that needs to observe the whole execution of a
-//! query, such as tracing, should wrap the stream with [`Response::map_stream()`].
+//! until it is exhausted or dropped.
+//!
+//! This has some consequences for generic Tower middleware, which only sees the response future:
+//! * Timeouts (e.g. `tower::timeout::Timeout`) limit the time until the first row is received.
+//! * Concurrency limits (e.g. `tower::limit::ConcurrencyLimit`) are released when the first
+//!   row is received.
+//!
+//! Middleware that needs to observe the whole execution of a query, such as tracing,
+//! should wrap the stream with [`Response::map_stream()`], like [`trace::TraceLayer`] does.
+//!
+//! ## Cancellation
+//! Dropping a response future or stream before it completes does not cancel the statement on
+//! the server: the connection discards the rest of the response before executing the next
+//! request. In particular, a timeout does not stop a long-running query; the next request
+//! on the connection waits for the query to finish. Consider setting a statement timeout on the
+//! server (e.g. `statement_timeout` in Postgres) as well.
 //!
 //! # Errors
 //! Middleware may return any error type that converts into a boxed error (like `tower::BoxError`).
 //! Errors are converted back into [`Error`]: if the error is an [`Error`], it's passed through
-//! unchanged, otherwise it's wrapped in [`Error::Middleware`].
+//! unchanged, otherwise it's wrapped in [`Error::Middleware`]. For example, `tower`'s timeout
+//! returns `Error::Middleware` wrapping `tower::timeout::error::Elapsed`.
 //!
-//! # Example: Tracing
+//! # Notes on Tower Middleware
+//! * Middleware services are type-erased with [`BoxService`], which is `Clone`: its clones
+//!   share the same instance of the middleware, so middleware which needs to clone its inner
+//!   service (like `tower::retry::Retry`) can be used anywhere.
+//! * A layer added to connect options is applied to each connection separately, so
+//!   `tower::limit::ConcurrencyLimitLayer` limits concurrency per connection (which is always 1).
+//!   Use `tower::limit::GlobalConcurrencyLimitLayer`, or add the layer to the pool, to limit
+//!   concurrency across connections.
+//! * Some middleware in the `tower` crate (e.g. `timeout`, `limit::rate` and `buffer`) requires
+//!   a Tokio runtime and panics otherwise.
+//! * Retrying requests inside a transaction is rarely correct, as the failure likely aborted
+//!   the transaction; see [`Request::in_transaction()`].
+//!
+//! # What Doesn't Pass Through Middleware
+//! * Establishing connections, including the statements used to initialize them (e.g. MySQL's
+//!   `SET` statement and SQLite's `PRAGMA`s), and pings (e.g. `PoolOptions::test_before_acquire`).
+//! * Queries the driver makes on its own to handle a request, e.g. resolving custom types in
+//!   Postgres. These are part of the request that triggered them.
+//! * `COPY` in Postgres, and notifications received by `PgListener` (statements like `LISTEN`
+//!   do pass through middleware).
+//! * The `ROLLBACK` queued when a [`Transaction`] is dropped without being committed or rolled
+//!   back, which is sent with the next request (or when the connection is returned to the pool).
+//!
+//! # Example: Implementing [`Layer`] and [`Service`]
 //! ```rust,no_run
 //! use std::task::{Context, Poll};
 //! use futures_util::future::BoxFuture;

@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+* Middleware support using [Tower](https://docs.rs/tower). See the new `sqlx::middleware` module.
+  * Every statement SQLx sends to the database on behalf of the user (queries, statement preparation, and transaction
+    control) is now an owned `middleware::Request` sent through a stack of `tower::Service`s, which answers with a
+    `middleware::Response` (a `'static` stream of results for queries). Any generic Tower middleware works,
+    including `tower`'s timeouts, concurrency and rate limits, retries and load shedding.
+  * `ConnectOptions::layer()` (and an inherent `layer()` on each driver's connect options) adds middleware to every
+    connection made with those options, including the connections of a pool.
+  * `PoolOptions::layer()` adds middleware for queries executed directly on a `&Pool`, before a connection is acquired.
+  * Connections and pools implement `tower::Service<Request<DB>>`, and `middleware::ServiceExecutor` turns any such
+    service back into an `Executor`, so middleware can also be applied ad hoc.
+  * `middleware::from_fn()` creates middleware from an async closure.
+  * `middleware::trace::TraceLayer` creates a `tracing` span per request following the OpenTelemetry semantic
+    conventions for database client spans (`db.system.name`, `db.query.text`, `db.namespace`, ...).
+  * `Query::extension()` (and on `QueryAs`, `QueryScalar` and `Map`) attaches values to the request for middleware.
+  * `Request::connection_info()` describes the database a request is sent to (from the new
+    `ConnectOptions::connection_info()`), and `Request::transaction_depth()` the transaction state of the connection.
+
+### Breaking
+* `Executor::dispatch()` is now the only required method of `Executor`; all other methods are provided.
+  Implementations of `Executor` outside of SQLx must implement `dispatch()`.
+* `ConnectOptions` has the new required methods `layers()` and `layers_mut()`.
+* `AnyConnectionBackend` replaces `fetch_many()`, `fetch_optional()`, `prepare_with()`, `describe()`, `begin()`,
+  `commit()` and `rollback()` with `service()`, which returns a `'static` request service.
+  `get_transaction_depth()` is now required.
+* New variant `Error::Middleware` for errors returned by middleware which are not a `sqlx::Error`.
+  (`Error` is `#[non_exhaustive]`.)
+* Postgres and MySQL: the protocol state of a connection is now shared with its middleware stack behind an
+  (uncontended) async mutex, so that responses can outlive the borrow of the connection.
+
 ## 0.9.0 - 2026-05-06
 
 ### Important Announcements

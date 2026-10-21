@@ -22,6 +22,13 @@ use std::{fmt::Debug, future};
 ///
 ///  * [`&Pool`](super::pool::Pool)
 ///  * [`&mut Connection`](super::connection::Connection)
+///  * [`&mut ServiceExecutor`](crate::middleware::ServiceExecutor), which wraps any
+///    [middleware](crate::middleware) stack.
+///
+/// # Middleware
+/// All methods of this trait are implemented on top of [`dispatch()`][Self::dispatch], which
+/// sends a [`Request`] through the [middleware](crate::middleware) stack of the
+/// connection or pool. To implement this trait, only `dispatch()` is required.
 ///
 /// The [`Executor`] impls for [`Transaction`](crate::transaction::Transaction)
 /// and [`PoolConnection`](crate::pool::PoolConnection) have been deleted because they
