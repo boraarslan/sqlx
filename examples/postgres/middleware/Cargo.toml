@@ -1,0 +1,12 @@
+[package]
+name = "sqlx-example-postgres-middleware"
+version = "0.1.0"
+edition = "2021"
+workspace = "../../../"
+
+[dependencies]
+sqlx = { path = "../../../", features = [ "runtime-tokio", "postgres" ] }
+tokio = { version = "1.25.0", features = ["rt-multi-thread", "macros", "time"] }
+tower = { version = "0.5.3", features = ["limit", "timeout"] }
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
