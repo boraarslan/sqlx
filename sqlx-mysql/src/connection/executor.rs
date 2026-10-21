@@ -1,7 +1,8 @@
 use super::MySqlStream;
 use crate::connection::stream::Waiting;
+use crate::connection::MySqlConn;
 use crate::error::Error;
-use crate::executor::{Execute, Executor};
+use crate::executor::Executor;
 use crate::ext::ustr::UStr;
 use crate::io::MySqlBufExt;
 use crate::logger::QueryLogger;
@@ -18,14 +19,13 @@ use crate::{
 };
 use either::Either;
 use futures_core::future::BoxFuture;
-use futures_core::stream::BoxStream;
 use futures_core::Stream;
-use futures_util::TryStreamExt;
 use sqlx_core::column::{ColumnOrigin, TableColumn};
+use sqlx_core::middleware::{Request, Response};
 use sqlx_core::sql_str::SqlStr;
-use std::{pin::pin, sync::Arc};
+use std::sync::Arc;
 
-impl MySqlConnection {
+impl MySqlConn {
     async fn prepare_statement(
         &mut self,
         sql: &str,
@@ -270,99 +270,17 @@ impl MySqlConnection {
     }
 }
 
-impl<'c> Executor<'c> for &'c mut MySqlConnection {
-    type Database = MySql;
-
-    fn fetch_many<'e, 'q, E>(
-        self,
-        mut query: E,
-    ) -> BoxStream<'e, Result<Either<MySqlQueryResult, MySqlRow>, Error>>
-    where
-        'c: 'e,
-        E: Execute<'q, Self::Database>,
-        'q: 'e,
-        E: 'q,
-    {
-        let arguments = query.take_arguments().map_err(Error::Encode);
-        let persistent = query.persistent();
-
-        Box::pin(try_stream! {
-        let sql = query.sql();
-            let arguments = arguments?;
-            let mut s = pin!(self.run(sql, arguments, persistent).await?);
-
-            while let Some(v) = s.try_next().await? {
-                r#yield!(v);
-            }
-
-            Ok(())
-        })
-    }
-
-    fn fetch_optional<'e, 'q, E>(self, query: E) -> BoxFuture<'e, Result<Option<MySqlRow>, Error>>
-    where
-        'c: 'e,
-        E: Execute<'q, Self::Database>,
-        'q: 'e,
-        E: 'q,
-    {
-        let mut s = self.fetch_many(query);
-
-        Box::pin(async move {
-            while let Some(v) = s.try_next().await? {
-                if let Either::Right(r) = v {
-                    return Ok(Some(r));
-                }
-            }
-
-            Ok(None)
-        })
-    }
-
-    fn prepare_with<'e>(
-        self,
+impl MySqlConn {
+    /// Prepare a statement, or get it from the cache.
+    pub(crate) async fn prepare_with_cache(
+        &mut self,
         sql: SqlStr,
-        _parameters: &'e [MySqlTypeInfo],
-    ) -> BoxFuture<'e, Result<MySqlStatement, Error>>
-    where
-        'c: 'e,
-    {
-        Box::pin(async move {
-            self.inner.stream.wait_until_ready().await?;
+    ) -> Result<MySqlStatement, Error> {
+        self.inner.stream.wait_until_ready().await?;
 
-            let metadata = if self.inner.cache_statement.is_enabled() {
-                self.get_or_prepare_statement(sql.as_str()).await?.1
-            } else {
-                let (id, metadata) = self.prepare_statement(sql.as_str()).await?;
-
-                self.inner
-                    .stream
-                    .send_packet(StmtClose { statement: id })
-                    .await?;
-
-                metadata
-            };
-
-            Ok(MySqlStatement {
-                sql,
-                // metadata has internal Arcs for expensive data structures
-                metadata: metadata.clone(),
-            })
-        })
-    }
-
-    #[doc(hidden)]
-    #[cfg(feature = "offline")]
-    fn describe<'e>(
-        self,
-        sql: SqlStr,
-    ) -> BoxFuture<'e, Result<crate::describe::Describe<MySql>, Error>>
-    where
-        'c: 'e,
-    {
-        Box::pin(async move {
-            self.inner.stream.wait_until_ready().await?;
-
+        let metadata = if self.inner.cache_statement.is_enabled() {
+            self.get_or_prepare_statement(sql.as_str()).await?.1
+        } else {
             let (id, metadata) = self.prepare_statement(sql.as_str()).await?;
 
             self.inner
@@ -370,22 +288,57 @@ impl<'c> Executor<'c> for &'c mut MySqlConnection {
                 .send_packet(StmtClose { statement: id })
                 .await?;
 
-            let columns = (*metadata.columns).clone();
+            metadata
+        };
 
-            let nullable = columns
-                .iter()
-                .map(|col| {
-                    col.flags
-                        .map(|flags| !flags.contains(crate::protocol::text::ColumnFlags::NOT_NULL))
-                })
-                .collect();
-
-            Ok(crate::describe::Describe {
-                parameters: Some(Either::Right(metadata.parameters)),
-                columns,
-                nullable,
-            })
+        Ok(MySqlStatement {
+            sql,
+            // metadata has internal Arcs for expensive data structures
+            metadata: metadata.clone(),
         })
+    }
+
+    #[cfg(feature = "offline")]
+    pub(crate) async fn describe(
+        &mut self,
+        sql: SqlStr,
+    ) -> Result<crate::describe::Describe<MySql>, Error> {
+        self.inner.stream.wait_until_ready().await?;
+
+        let (id, metadata) = self.prepare_statement(sql.as_str()).await?;
+
+        self.inner
+            .stream
+            .send_packet(StmtClose { statement: id })
+            .await?;
+
+        let columns = (*metadata.columns).clone();
+
+        let nullable = columns
+            .iter()
+            .map(|col| {
+                col.flags
+                    .map(|flags| !flags.contains(crate::protocol::text::ColumnFlags::NOT_NULL))
+            })
+            .collect();
+
+        Ok(crate::describe::Describe {
+            parameters: Some(Either::Right(metadata.parameters)),
+            columns,
+            nullable,
+        })
+    }
+}
+
+impl<'c> Executor<'c> for &'c mut MySqlConnection {
+    type Database = MySql;
+
+    #[inline]
+    fn dispatch<'e>(self, request: Request<MySql>) -> BoxFuture<'e, Result<Response<MySql>, Error>>
+    where
+        'c: 'e,
+    {
+        self.service.dispatch(request)
     }
 }
 

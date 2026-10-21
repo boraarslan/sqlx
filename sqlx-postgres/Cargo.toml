@@ -72,6 +72,8 @@ thiserror.workspace = true
 serde = { version = "1.0.219", optional = true, features = ["derive"] }
 serde_json = { version = "1.0.142", optional = true, features = ["raw_value"] }
 
+async-lock.workspace = true
+
 [dependencies.sqlx-core]
 workspace = true
 

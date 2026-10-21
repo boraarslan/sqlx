@@ -1,7 +1,8 @@
 use crate::connection::ConnectOptions;
 use crate::error::Error;
-use crate::{PgConnectOptions, PgConnection};
+use crate::{PgConnectOptions, PgConnection, Postgres};
 use log::LevelFilter;
+use sqlx_core::middleware::{BoxService, Layers};
 use sqlx_core::Url;
 use std::future::Future;
 use std::time::Duration;
@@ -32,5 +33,13 @@ impl ConnectOptions for PgConnectOptions {
     fn log_slow_statements(mut self, level: LevelFilter, duration: Duration) -> Self {
         self.log_settings.log_slow_statements(level, duration);
         self
+    }
+
+    fn layers(&self) -> &Layers<BoxService<Postgres>> {
+        &self.layers
+    }
+
+    fn layers_mut(&mut self) -> &mut Layers<BoxService<Postgres>> {
+        &mut self.layers
     }
 }

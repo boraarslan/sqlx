@@ -68,6 +68,7 @@ pub mod from_row;
 pub mod fs;
 pub mod io;
 pub mod logger;
+pub mod middleware;
 pub mod net;
 pub mod query_as;
 pub mod query_builder;

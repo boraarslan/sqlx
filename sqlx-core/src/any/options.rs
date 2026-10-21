@@ -1,6 +1,7 @@
-use crate::any::AnyConnection;
+use crate::any::{Any, AnyConnection};
 use crate::connection::{ConnectOptions, LogSettings};
 use crate::error::Error;
+use crate::middleware::{BoxService, Layers};
 use log::LevelFilter;
 use std::future::Future;
 use std::str::FromStr;
@@ -19,6 +20,7 @@ use url::Url;
 pub struct AnyConnectOptions {
     pub database_url: Url,
     pub log_settings: LogSettings,
+    pub(crate) layers: Layers<BoxService<Any>>,
 }
 impl FromStr for AnyConnectOptions {
     type Err = Error;
@@ -29,6 +31,7 @@ impl FromStr for AnyConnectOptions {
                 .parse::<Url>()
                 .map_err(|e| Error::Configuration(e.into()))?,
             log_settings: LogSettings::default(),
+            layers: Layers::new(),
         })
     }
 }
@@ -40,6 +43,7 @@ impl ConnectOptions for AnyConnectOptions {
         Ok(AnyConnectOptions {
             database_url: url.clone(),
             log_settings: LogSettings::default(),
+            layers: Layers::new(),
         })
     }
 
@@ -61,6 +65,14 @@ impl ConnectOptions for AnyConnectOptions {
         self.log_settings.slow_statements_level = level;
         self.log_settings.slow_statements_duration = duration;
         self
+    }
+
+    fn layers(&self) -> &Layers<BoxService<Any>> {
+        &self.layers
+    }
+
+    fn layers_mut(&mut self) -> &mut Layers<BoxService<Any>> {
+        &mut self.layers
     }
 }
 

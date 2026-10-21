@@ -32,6 +32,8 @@ pub use connection::AnyConnection;
 
 use crate::encode::Encode;
 pub use connection::AnyConnectionBackend;
+#[doc(hidden)]
+pub use connection::AnyServiceAdapter;
 pub use database::Any;
 #[allow(deprecated)]
 pub use kind::AnyKind;

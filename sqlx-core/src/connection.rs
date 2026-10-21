@@ -2,6 +2,8 @@ use crate::database::{Database, HasStatementCache};
 use crate::error::Error;
 
 use crate::config;
+use crate::error::BoxDynError;
+use crate::middleware::{BoxService, Layer, Layers, Request, Response, Service};
 use crate::sql_str::SqlSafeStr;
 use crate::transaction::{Transaction, TransactionManager};
 use futures_core::future::BoxFuture;
@@ -270,6 +272,49 @@ pub trait ConnectOptions: 'static + Send + Sync + FromStr<Err = Error> + Debug +
         self.log_statements(LevelFilter::Off)
             .log_slow_statements(LevelFilter::Off, Duration::default())
     }
+
+    /// Add a [Tower] middleware [`Layer`] to every connection made with these options.
+    ///
+    /// Every statement executed on such a connection is sent through the layer as a
+    /// [`Request`], whether it's executed on the connection directly, on a [`Transaction`], or
+    /// through a [`Pool`][crate::pool::Pool] the connection belongs to. This includes transaction
+    /// control statements (`BEGIN`, `COMMIT`, `ROLLBACK`, and their savepoint equivalents),
+    /// except a `ROLLBACK` queued when a [`Transaction`] is dropped without being committed or
+    /// rolled back, which is sent when the connection is next used.
+    ///
+    /// Each connection gets its own instance of the middleware stack, so state kept by a service
+    /// (like a rate limit) applies per connection. Share state between connections through
+    /// the layer, e.g. with an `Arc`.
+    ///
+    /// Layers are applied like `tower::ServiceBuilder`: the first layer added is the outermost
+    /// and sees each request first.
+    ///
+    /// See the [`middleware`][crate::middleware] module for details.
+    ///
+    /// [Tower]: https://docs.rs/tower
+    fn layer<L>(mut self, layer: L) -> Self
+    where
+        L: Layer<BoxService<<Self::Connection as Connection>::Database>> + Send + Sync + 'static,
+        L::Service: Service<
+                Request<<Self::Connection as Connection>::Database>,
+                Response = Response<<Self::Connection as Connection>::Database>,
+            > + Send
+            + 'static,
+        <L::Service as Service<Request<<Self::Connection as Connection>::Database>>>::Error:
+            Into<BoxDynError> + 'static,
+        <L::Service as Service<Request<<Self::Connection as Connection>::Database>>>::Future:
+            Send + 'static,
+    {
+        self.layers_mut().push(layer);
+        self
+    }
+
+    /// The middleware layers added with [`layer()`][Self::layer].
+    fn layers(&self) -> &Layers<BoxService<<Self::Connection as Connection>::Database>>;
+
+    /// A mutable reference to the middleware layers added with [`layer()`][Self::layer].
+    fn layers_mut(&mut self)
+        -> &mut Layers<BoxService<<Self::Connection as Connection>::Database>>;
 
     #[doc(hidden)]
     fn __unstable_apply_driver_config(

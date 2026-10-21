@@ -1,3 +1,4 @@
+use crate::connection::PgConn;
 use crate::connection::TableData;
 use crate::error::Error;
 use crate::ext::ustr::UStr;
@@ -6,7 +7,7 @@ use crate::statement::PgStatementMetadata;
 use crate::type_info::{PgCustomType, PgType, PgTypeKind};
 use crate::types::Oid;
 use crate::{HashMap, PgRow, PgValueRef, Postgres};
-use crate::{PgColumn, PgConnection, PgTypeInfo};
+use crate::{PgColumn, PgTypeInfo};
 use sqlx_core::column::{ColumnOrigin, TableColumn};
 use sqlx_core::decode::Decode;
 use sqlx_core::error::BoxDynError;
@@ -26,7 +27,7 @@ use std::sync::Arc;
 // we'd have to replace the unnamed prepared statement which is already the one the user wanted
 // to execute. This means we'd have to immediately re-prepare it, adding an extra round trip.
 
-impl PgConnection {
+impl PgConn {
     pub(super) async fn resolve_statement_metadata<const QUERIES_ALLOWED: bool>(
         &mut self,
         param_desc: Option<ParameterDescription>,
@@ -403,7 +404,7 @@ impl TypeResolver {
         }
     }
 
-    async fn fill_cache(&mut self, conn: &mut PgConnection) -> Result<bool, Error> {
+    async fn fill_cache(&mut self, conn: &mut PgConn) -> Result<bool, Error> {
         let mut missing_dependencies = HashMap::<Oid, Vec<TypeResolverRow>>::new();
         let mut ran_query = false;
 
@@ -551,7 +552,7 @@ impl ColumnResolver {
         }
     }
 
-    async fn fill_cache(&mut self, conn: &mut PgConnection) -> Result<bool, Error> {
+    async fn fill_cache(&mut self, conn: &mut PgConn) -> Result<bool, Error> {
         if self.query.is_empty() {
             return Ok(false);
         }

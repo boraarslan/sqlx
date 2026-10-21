@@ -9,9 +9,7 @@ use sqlx_core::sql_str::SqlStr;
 use tracing::span::Span;
 
 use sqlx_core::error::Error;
-use sqlx_core::transaction::{
-    begin_ansi_transaction_sql, commit_ansi_transaction_sql, rollback_ansi_transaction_sql,
-};
+use sqlx_core::transaction::rollback_ansi_transaction_sql;
 use sqlx_core::Either;
 
 use crate::connection::establish::EstablishParams;
@@ -28,6 +26,7 @@ use crate::connection::deserialize::{deserialize, serialize, SchemaName, SqliteO
 //       OS resource usage. Low priority because a high concurrent load for SQLite3 is very
 //       unlikely.
 
+#[derive(Clone)]
 pub(crate) struct ConnectionWorker {
     command_tx: flume::Sender<(Command, tracing::Span)>,
     /// Mutex for locking access to the database.
@@ -35,6 +34,10 @@ pub(crate) struct ConnectionWorker {
 }
 
 pub(crate) struct WorkerSharedState {
+    /// The transaction depth as seen by the connection.
+    ///
+    /// This is maintained by the sender of transaction commands rather than the worker,
+    /// so that it's up-to-date as soon as a `ROLLBACK` is queued by `start_rollback()`.
     transaction_depth: AtomicUsize,
     cached_statements_size: AtomicUsize,
     pub(crate) conn: Mutex<ConnectionState>,
@@ -43,6 +46,18 @@ pub(crate) struct WorkerSharedState {
 impl WorkerSharedState {
     pub(crate) fn get_transaction_depth(&self) -> usize {
         self.transaction_depth.load(Ordering::Acquire)
+    }
+
+    fn increment_transaction_depth(&self) {
+        self.transaction_depth.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn decrement_transaction_depth(&self) {
+        let _ = self
+            .transaction_depth
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+                depth.checked_sub(1)
+            });
     }
 
     pub(crate) fn get_cached_statements_size(&self) -> usize {
@@ -81,13 +96,17 @@ enum Command {
     },
     Begin {
         tx: rendezvous_oneshot::Sender<Result<(), Error>>,
-        statement: Option<SqlStr>,
+        statement: SqlStr,
+        /// The transaction depth before this statement.
+        depth: usize,
     },
     Commit {
         tx: rendezvous_oneshot::Sender<Result<(), Error>>,
+        statement: SqlStr,
     },
     Rollback {
         tx: Option<rendezvous_oneshot::Sender<Result<(), Error>>>,
+        statement: SqlStr,
     },
     UnlockDb,
     ClearCache {
@@ -210,35 +229,14 @@ impl ConnectionWorker {
 
                             update_cached_statements_size(&conn, &shared.cached_statements_size);
                         }
-                        Command::Begin { tx, statement } => {
-                            let depth = shared.transaction_depth.load(Ordering::Acquire);
+                        Command::Begin { tx, statement, depth } => {
+                            let res = conn.handle.exec(statement.as_str()).and_then(|res| {
+                                if !conn.handle.in_transaction() {
+                                    return Err(Error::BeginFailed);
+                                }
 
-                            let is_custom_statement = statement.is_some();
-                            let statement = match statement {
-                                // custom `BEGIN` statements are not allowed if
-                                // we're already in a transaction (we need to
-                                // issue a `SAVEPOINT` instead)
-                                Some(_) if depth > 0 => {
-                                    if tx.blocking_send(Err(Error::InvalidSavePointStatement)).is_err() {
-                                        break;
-                                    }
-                                    continue;
-                                },
-                                Some(statement) => statement,
-                                None => begin_ansi_transaction_sql(depth),
-                            };
-                            let res =
-                                conn.handle
-                                    .exec(statement.as_str())
-                                    .and_then(|res| {
-                                        if is_custom_statement && !conn.handle.in_transaction() {
-                                            return Err(Error::BeginFailed)
-                                        }
-
-                                        shared.transaction_depth.fetch_add(1, Ordering::Release);
-
-                                        Ok(res)
-                                    });
+                                Ok(res)
+                            });
                             let res_ok = res.is_ok();
 
                             if tx.blocking_send(res).is_err() && res_ok {
@@ -249,9 +247,6 @@ impl ConnectionWorker {
                                 if let Err(error) = conn
                                     .handle
                                     .exec(rollback_ansi_transaction_sql(depth + 1).as_str())
-                                    .map(|_| {
-                                        shared.transaction_depth.fetch_sub(1, Ordering::Release);
-                                    })
                                 {
                                     // The rollback failed. To prevent leaving the connection
                                     // in an inconsistent state we shutdown this worker which
@@ -261,18 +256,8 @@ impl ConnectionWorker {
                                 }
                             }
                         }
-                        Command::Commit { tx } => {
-                            let depth = shared.transaction_depth.load(Ordering::Acquire);
-
-                            let res = if depth > 0 {
-                                conn.handle
-                                    .exec(commit_ansi_transaction_sql(depth).as_str())
-                                    .map(|_| {
-                                        shared.transaction_depth.fetch_sub(1, Ordering::Release);
-                                    })
-                            } else {
-                                Ok(())
-                            };
+                        Command::Commit { tx, statement } => {
+                            let res = conn.handle.exec(statement.as_str()).map(|_| ());
                             let res_ok = res.is_ok();
 
                             if tx.blocking_send(res).is_err() && res_ok {
@@ -282,24 +267,13 @@ impl ConnectionWorker {
                                 ignore_next_start_rollback = true;
                             }
                         }
-                        Command::Rollback { tx } => {
+                        Command::Rollback { tx, statement } => {
                             if ignore_next_start_rollback && tx.is_none() {
                                 ignore_next_start_rollback = false;
                                 continue;
                             }
 
-                            let depth = shared.transaction_depth.load(Ordering::Acquire);
-
-                            let res = if depth > 0 {
-                                conn.handle
-                                    .exec(rollback_ansi_transaction_sql(depth).as_str())
-                                    .map(|_| {
-                                        shared.transaction_depth.fetch_sub(1, Ordering::Release);
-                                    })
-                            } else {
-                                Ok(())
-                            };
-
+                            let res = conn.handle.exec(statement.as_str()).map(|_| ());
                             let res_ok = res.is_ok();
 
                             if let Some(tx) = tx {
@@ -347,14 +321,14 @@ impl ConnectionWorker {
         establish_rx.await.map_err(|_| Error::WorkerCrashed)?
     }
 
-    pub(crate) async fn prepare(&mut self, query: SqlStr) -> Result<SqliteStatement, Error> {
+    pub(crate) async fn prepare(&self, query: SqlStr) -> Result<SqliteStatement, Error> {
         self.oneshot_cmd(|tx| Command::Prepare { query, tx })
             .await?
     }
 
     #[cfg(feature = "offline")]
     pub(crate) async fn describe(
-        &mut self,
+        &self,
         query: SqlStr,
     ) -> Result<sqlx_core::describe::Describe<crate::Sqlite>, Error> {
         self.oneshot_cmd(|tx| Command::Describe { query, tx })
@@ -362,7 +336,7 @@ impl ConnectionWorker {
     }
 
     pub(crate) async fn execute(
-        &mut self,
+        &self,
         query: SqlStr,
         args: Option<SqliteArguments>,
         chan_size: usize,
@@ -388,34 +362,79 @@ impl ConnectionWorker {
         Ok(rx)
     }
 
-    pub(crate) async fn begin(&mut self, statement: Option<SqlStr>) -> Result<(), Error> {
-        self.oneshot_cmd_with_ack(|tx| Command::Begin { tx, statement })
-            .await?
+    /// Execute a statement which begins a transaction or creates a savepoint.
+    pub(crate) async fn begin(&self, statement: SqlStr) -> Result<(), Error> {
+        let depth = self.shared.get_transaction_depth();
+
+        self.oneshot_cmd_with_ack(|tx| Command::Begin {
+            tx,
+            statement,
+            depth,
+        })
+        .await??;
+
+        self.shared.increment_transaction_depth();
+
+        Ok(())
     }
 
-    pub(crate) async fn commit(&mut self) -> Result<(), Error> {
-        self.oneshot_cmd_with_ack(|tx| Command::Commit { tx })
-            .await?
+    /// Execute a statement which commits a transaction or releases a savepoint,
+    /// if in a transaction.
+    pub(crate) async fn commit(&self, statement: SqlStr) -> Result<(), Error> {
+        if self.shared.get_transaction_depth() > 0 {
+            self.oneshot_cmd_with_ack(|tx| Command::Commit { tx, statement })
+                .await??;
+
+            self.shared.decrement_transaction_depth();
+        }
+
+        Ok(())
     }
 
-    pub(crate) async fn rollback(&mut self) -> Result<(), Error> {
-        self.oneshot_cmd_with_ack(|tx| Command::Rollback { tx: Some(tx) })
-            .await?
+    /// Execute a statement which rolls back a transaction or to a savepoint,
+    /// if in a transaction.
+    pub(crate) async fn rollback(&self, statement: SqlStr) -> Result<(), Error> {
+        if self.shared.get_transaction_depth() > 0 {
+            self.oneshot_cmd_with_ack(|tx| Command::Rollback {
+                tx: Some(tx),
+                statement,
+            })
+            .await??;
+
+            self.shared.decrement_transaction_depth();
+        }
+
+        Ok(())
     }
 
-    pub(crate) fn start_rollback(&mut self) -> Result<(), Error> {
-        self.command_tx
-            .send((Command::Rollback { tx: None }, Span::current()))
-            .map_err(|_| Error::WorkerCrashed)
+    /// Queue a rollback of the current transaction or savepoint, if any, without waiting for it.
+    pub(crate) fn start_rollback(&self) -> Result<(), Error> {
+        let depth = self.shared.get_transaction_depth();
+
+        if depth > 0 {
+            self.command_tx
+                .send((
+                    Command::Rollback {
+                        tx: None,
+                        statement: rollback_ansi_transaction_sql(depth),
+                    },
+                    Span::current(),
+                ))
+                .map_err(|_| Error::WorkerCrashed)?;
+
+            self.shared.decrement_transaction_depth();
+        }
+
+        Ok(())
     }
 
-    pub(crate) async fn ping(&mut self) -> Result<(), Error> {
+    pub(crate) async fn ping(&self) -> Result<(), Error> {
         self.oneshot_cmd(|tx| Command::Ping { tx }).await
     }
 
     #[cfg(feature = "deserialize")]
     pub(crate) async fn deserialize(
-        &mut self,
+        &self,
         schema: Option<SchemaName>,
         data: SqliteOwnedBuf,
         read_only: bool,
@@ -431,14 +450,14 @@ impl ConnectionWorker {
 
     #[cfg(feature = "deserialize")]
     pub(crate) async fn serialize(
-        &mut self,
+        &self,
         schema: Option<SchemaName>,
     ) -> Result<SqliteOwnedBuf, Error> {
         self.oneshot_cmd(|tx| Command::Serialize { schema, tx })
             .await?
     }
 
-    async fn oneshot_cmd<F, T>(&mut self, command: F) -> Result<T, Error>
+    async fn oneshot_cmd<F, T>(&self, command: F) -> Result<T, Error>
     where
         F: FnOnce(oneshot::Sender<T>) -> Command,
     {
@@ -452,7 +471,7 @@ impl ConnectionWorker {
         rx.await.map_err(|_| Error::WorkerCrashed)
     }
 
-    async fn oneshot_cmd_with_ack<F, T>(&mut self, command: F) -> Result<T, Error>
+    async fn oneshot_cmd_with_ack<F, T>(&self, command: F) -> Result<T, Error>
     where
         F: FnOnce(rendezvous_oneshot::Sender<T>) -> Command,
     {
@@ -466,7 +485,7 @@ impl ConnectionWorker {
         rx.recv().await.map_err(|_| Error::WorkerCrashed)
     }
 
-    pub(crate) async fn clear_cache(&mut self) -> Result<(), Error> {
+    pub(crate) async fn clear_cache(&self) -> Result<(), Error> {
         self.oneshot_cmd(|tx| Command::ClearCache { tx }).await
     }
 

@@ -6,7 +6,7 @@ use futures_core::stream::BoxStream;
 
 use sqlx_core::bytes::{BufMut, Bytes};
 
-use crate::connection::PgConnection;
+use crate::connection::{PgConn, PgConnection};
 use crate::error::{Error, Result};
 use crate::ext::async_stream::TryAsyncStream;
 use crate::io::AsyncRead;
@@ -16,6 +16,7 @@ use crate::message::{
 };
 use crate::pool::{Pool, PoolConnection};
 use crate::Postgres;
+use async_lock::MutexGuardArc;
 
 impl PgConnection {
     /// Issue a `COPY FROM STDIN` statement and transition the connection to streaming data
@@ -141,24 +142,30 @@ pub const PG_COPY_MAX_DATA_LEN: usize = 0x3fffffff - 1 - 4;
 /// will return an error the next time it is used.
 #[must_use = "connection will error on next use if `.finish()` or `.abort()` is not called"]
 pub struct PgCopyIn<C: DerefMut<Target = PgConnection>> {
+    // The connection is locked for the duration of the `COPY`.
+    // Must be dropped before `conn`.
+    locked: Option<MutexGuardArc<PgConn>>,
     conn: Option<C>,
     response: CopyResponseData,
 }
 
 impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
-    async fn begin(mut conn: C, statement: &str) -> Result<Self> {
-        conn.wait_until_ready().await?;
-        conn.inner.stream.send(Query(statement)).await?;
+    async fn begin(conn: C, statement: &str) -> Result<Self> {
+        let mut locked = conn.lock().await;
 
-        let response = match conn.inner.stream.recv_expect::<CopyInResponse>().await {
+        locked.wait_until_ready().await?;
+        locked.inner.stream.send(Query(statement)).await?;
+
+        let response = match locked.inner.stream.recv_expect::<CopyInResponse>().await {
             Ok(res) => res.0,
             Err(e) => {
-                conn.inner.stream.recv().await?;
+                locked.inner.stream.recv().await?;
                 return Err(e);
             }
         };
 
         Ok(PgCopyIn {
+            locked: Some(locked),
             conn: Some(conn),
             response,
         })
@@ -195,7 +202,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     /// If you're copying data from an `AsyncRead`, maybe consider [Self::read_from] instead.
     pub async fn send(&mut self, data: impl Deref<Target = [u8]>) -> Result<&mut Self> {
         for chunk in data.deref().chunks(PG_COPY_MAX_DATA_LEN) {
-            self.conn
+            self.locked
                 .as_deref_mut()
                 .expect("send_data: conn taken")
                 .inner
@@ -222,7 +229,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     /// If both `runtime-async-std` and `runtime-tokio` features are enabled, the Tokio version
     /// takes precedent.
     pub async fn read_from(&mut self, mut source: impl AsyncRead + Unpin) -> Result<&mut Self> {
-        let conn: &mut PgConnection = self.conn.as_deref_mut().expect("copy_from: conn taken");
+        let conn: &mut PgConn = self.locked.as_deref_mut().expect("copy_from: conn taken");
         loop {
             let buf = conn.inner.stream.write_buffer_mut();
 
@@ -255,8 +262,12 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     ///
     /// The server is expected to respond with an error, so only _unexpected_ errors are returned.
     pub async fn abort(mut self, msg: impl Into<String>) -> Result<()> {
+        self.conn
+            .take()
+            .expect("PgCopyIn::fail_with: conn taken illegally");
+
         let mut conn = self
-            .conn
+            .locked
             .take()
             .expect("PgCopyIn::fail_with: conn taken illegally");
 
@@ -285,8 +296,12 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     ///
     /// The number of rows affected is returned.
     pub async fn finish(mut self) -> Result<u64> {
+        self.conn
+            .take()
+            .expect("CopyWriter::finish: conn taken illegally");
+
         let mut conn = self
-            .conn
+            .locked
             .take()
             .expect("CopyWriter::finish: conn taken illegally");
 
@@ -307,27 +322,36 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
 
 impl<C: DerefMut<Target = PgConnection>> Drop for PgCopyIn<C> {
     fn drop(&mut self) {
-        if let Some(mut conn) = self.conn.take() {
-            conn.inner
-                .stream
-                .write_msg(CopyFail::new(
-                    "PgCopyIn dropped without calling finish() or fail()",
-                ))
-                .expect("BUG: PgCopyIn abort message should not be too large");
+        if self.conn.take().is_some() {
+            if let Some(locked) = &mut self.locked {
+                locked
+                    .inner
+                    .stream
+                    .write_msg(CopyFail::new(
+                        "PgCopyIn dropped without calling finish() or fail()",
+                    ))
+                    .expect("BUG: PgCopyIn abort message should not be too large");
+            }
         }
     }
 }
 
 async fn pg_begin_copy_out<'c, C: DerefMut<Target = PgConnection> + Send + 'c>(
-    mut conn: C,
+    handle: C,
     statement: &str,
 ) -> Result<BoxStream<'c, Result<Bytes>>> {
+    // The connection is locked until the stream is dropped.
+    let mut conn = handle.lock().await;
+
     conn.wait_until_ready().await?;
     conn.inner.stream.send(Query(statement)).await?;
 
     let _: CopyOutResponse = conn.inner.stream.recv_expect().await?;
 
     let stream: TryAsyncStream<'c, Bytes> = try_stream! {
+        // Keep the handle alive (e.g. a `PoolConnection`) until the stream is dropped.
+        let _handle = handle;
+
         loop {
             match conn.inner.stream.recv().await {
                 Err(e) => {

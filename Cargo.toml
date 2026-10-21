@@ -195,6 +195,12 @@ cfg-if = "1.0.0"
 dotenvy = { version = "0.15.7", default-features = false }
 thiserror = { version = "2.0.18", default-features = false, features = ["std"] }
 
+# Middleware (Tower) support
+tower-layer = "0.3.3"
+tower-service = "0.3.3"
+sync_wrapper = "1.0.2"
+async-lock = "3.4.2"
+
 # Cryptography
 crc = { version = "3.0.0" }
 digest = { version = "0.11.2", default-features = false, features = ["alloc"] }

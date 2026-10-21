@@ -9,6 +9,7 @@ use crate::database::{Database, HasStatementCache};
 use crate::encode::Encode;
 use crate::error::{BoxDynError, Error};
 use crate::executor::{Execute, Executor};
+use crate::middleware::Extensions;
 use crate::sql_str::{SqlSafeStr, SqlStr};
 use crate::statement::Statement;
 use crate::types::Type;
@@ -20,6 +21,7 @@ pub struct Query<'q, DB: Database, A> {
     pub(crate) arguments: Option<Result<A, BoxDynError>>,
     pub(crate) database: PhantomData<DB>,
     pub(crate) persistent: bool,
+    pub(crate) extensions: Extensions,
 }
 
 /// A single SQL query that will map its results to an owned Rust type.
@@ -70,6 +72,11 @@ where
     #[inline]
     fn persistent(&self) -> bool {
         self.persistent
+    }
+
+    #[inline]
+    fn take_extensions(&mut self) -> Extensions {
+        std::mem::take(&mut self.extensions)
     }
 }
 
@@ -137,6 +144,30 @@ where
     /// Default: `true`.
     pub fn persistent(mut self, value: bool) -> Self {
         self.persistent = value;
+        self
+    }
+}
+
+impl<DB: Database, A> Query<'_, DB, A> {
+    /// Attach a value to the [`Request`][crate::middleware::Request] made for this query,
+    /// for use by middleware.
+    ///
+    /// Values are keyed by type; adding a value of the same type twice replaces the first.
+    ///
+    /// See [`Extensions`] and the [`middleware`][crate::middleware] module.
+    pub fn extension<T: Clone + Send + Sync + 'static>(mut self, value: T) -> Self {
+        self.extensions.insert(value);
+        self
+    }
+}
+
+impl<DB: Database, F, A> Map<'_, DB, F, A> {
+    /// Attach a value to the [`Request`][crate::middleware::Request] made for this query,
+    /// for use by middleware.
+    ///
+    /// See [`Query::extension()`].
+    pub fn extension<T: Clone + Send + Sync + 'static>(mut self, value: T) -> Self {
+        self.inner = self.inner.extension(value);
         self
     }
 }
@@ -321,6 +352,11 @@ where
     #[inline]
     fn persistent(&self) -> bool {
         self.inner.arguments.is_some()
+    }
+
+    #[inline]
+    fn take_extensions(&mut self) -> Extensions {
+        self.inner.take_extensions()
     }
 }
 
@@ -509,6 +545,7 @@ where
         arguments: Some(Ok(Default::default())),
         statement: Either::Right(statement),
         persistent: true,
+        extensions: Extensions::new(),
     }
 }
 
@@ -523,6 +560,7 @@ where
         arguments: Some(Ok(arguments)),
         statement: Either::Right(statement),
         persistent: true,
+        extensions: Extensions::new(),
     }
 }
 
@@ -659,6 +697,7 @@ where
         arguments: Some(Ok(Default::default())),
         statement: Either::Left(sql.into_sql_str()),
         persistent: true,
+        extensions: Extensions::new(),
     }
 }
 
@@ -687,5 +726,6 @@ where
         arguments: Some(arguments),
         statement: Either::Left(sql.into_sql_str()),
         persistent: true,
+        extensions: Extensions::new(),
     }
 }

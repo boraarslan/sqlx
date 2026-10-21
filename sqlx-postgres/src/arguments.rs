@@ -2,10 +2,11 @@ use std::fmt::{self, Write};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
+use crate::connection::PgConn;
 use crate::encode::{Encode, IsNull};
 use crate::error::Error;
 use crate::types::Type;
-use crate::{PgConnection, PgTypeInfo, Postgres};
+use crate::{PgTypeInfo, Postgres};
 
 pub(crate) use sqlx_core::arguments::Arguments;
 use sqlx_core::error::BoxDynError;
@@ -104,7 +105,7 @@ impl PgArguments {
     // This should only go out and ask postgres if we have not seen the type name yet
     pub(crate) async fn apply_patches(
         &mut self,
-        conn: &mut PgConnection,
+        conn: &mut PgConn,
         parameters: &[PgTypeInfo],
     ) -> Result<(), Error> {
         let PgArgumentBuffer {

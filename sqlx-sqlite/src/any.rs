@@ -1,24 +1,23 @@
 use crate::{
-    Either, Sqlite, SqliteArgumentValue, SqliteArguments, SqliteColumn, SqliteConnectOptions,
-    SqliteConnection, SqliteQueryResult, SqliteRow, SqliteTransactionManager, SqliteTypeInfo,
+    Sqlite, SqliteArgumentValue, SqliteArguments, SqliteColumn, SqliteConnectOptions,
+    SqliteConnection, SqliteQueryResult, SqliteRow, SqliteStatement, SqliteTransactionManager,
+    SqliteTypeInfo,
 };
 use futures_core::future::BoxFuture;
-use futures_core::stream::BoxStream;
-use futures_util::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures_util::FutureExt;
 
 use sqlx_core::any::{
-    AnyArguments, AnyColumn, AnyConnectOptions, AnyConnectionBackend, AnyQueryResult, AnyRow,
-    AnyStatement, AnyTypeInfo, AnyTypeInfoKind, AnyValueKind,
+    Any, AnyArguments, AnyColumn, AnyConnectOptions, AnyConnectionBackend, AnyQueryResult, AnyRow,
+    AnyServiceAdapter, AnyTypeInfo, AnyTypeInfoKind, AnyValueKind,
 };
-use sqlx_core::sql_str::SqlStr;
+use sqlx_core::middleware::BoxService;
 
 use crate::arguments::SqliteArgumentsBuffer;
+use crate::connection::SqliteDriver;
 use crate::type_info::DataType;
 use sqlx_core::connection::{ConnectOptions, Connection};
 use sqlx_core::database::Database;
-use sqlx_core::executor::Executor;
 use sqlx_core::transaction::TransactionManager;
-use std::pin::pin;
 use std::sync::Arc;
 
 sqlx_core::declare_driver_with_optional_migrate!(DRIVER = Sqlite);
@@ -40,16 +39,15 @@ impl AnyConnectionBackend for SqliteConnection {
         Connection::ping(self).boxed()
     }
 
-    fn begin(&mut self, statement: Option<SqlStr>) -> BoxFuture<'_, sqlx_core::Result<()>> {
-        SqliteTransactionManager::begin(self, statement).boxed()
-    }
-
-    fn commit(&mut self) -> BoxFuture<'_, sqlx_core::Result<()>> {
-        SqliteTransactionManager::commit(self).boxed()
-    }
-
-    fn rollback(&mut self) -> BoxFuture<'_, sqlx_core::Result<()>> {
-        SqliteTransactionManager::rollback(self).boxed()
+    fn service(&mut self) -> BoxService<Any> {
+        BoxService::new(AnyServiceAdapter::new(
+            SqliteDriver {
+                worker: self.worker.clone(),
+                row_channel_size: self.row_channel_size,
+            },
+            |arguments| Ok(map_arguments(arguments)),
+            |statement: &SqliteStatement| statement.column_names.clone(),
+        ))
     }
 
     fn start_rollback(&mut self) {
@@ -77,74 +75,6 @@ impl AnyConnectionBackend for SqliteConnection {
         &mut self,
     ) -> sqlx_core::Result<&mut (dyn sqlx_core::migrate::Migrate + Send + 'static)> {
         Ok(self)
-    }
-
-    fn fetch_many(
-        &mut self,
-        query: SqlStr,
-        persistent: bool,
-        arguments: Option<AnyArguments>,
-    ) -> BoxStream<'_, sqlx_core::Result<Either<AnyQueryResult, AnyRow>>> {
-        let persistent = persistent && arguments.is_some();
-        let args = arguments.map(map_arguments);
-
-        Box::pin(
-            self.worker
-                .execute(query, args, self.row_channel_size, persistent, None)
-                .map_ok(flume::Receiver::into_stream)
-                .try_flatten_stream()
-                .map(
-                    move |res: sqlx_core::Result<Either<SqliteQueryResult, SqliteRow>>| match res? {
-                        Either::Left(result) => Ok(Either::Left(result.into())),
-                        Either::Right(row) => Ok(Either::Right(AnyRow::try_from(&row)?)),
-                    },
-                ),
-        )
-    }
-
-    fn fetch_optional(
-        &mut self,
-        query: SqlStr,
-        persistent: bool,
-        arguments: Option<AnyArguments>,
-    ) -> BoxFuture<'_, sqlx_core::Result<Option<AnyRow>>> {
-        let persistent = persistent && arguments.is_some();
-        let args = arguments.map(map_arguments);
-
-        Box::pin(async move {
-            let mut stream = pin!(
-                self.worker
-                    .execute(query, args, self.row_channel_size, persistent, Some(1))
-                    .map_ok(flume::Receiver::into_stream)
-                    .await?
-            );
-
-            if let Some(Either::Right(row)) = stream.try_next().await? {
-                return Ok(Some(AnyRow::try_from(&row)?));
-            }
-
-            Ok(None)
-        })
-    }
-
-    fn prepare_with<'c, 'q: 'c>(
-        &'c mut self,
-        sql: SqlStr,
-        _parameters: &[AnyTypeInfo],
-    ) -> BoxFuture<'c, sqlx_core::Result<AnyStatement>> {
-        Box::pin(async move {
-            let statement = Executor::prepare_with(self, sql, &[]).await?;
-            let column_names = statement.column_names.clone();
-            AnyStatement::try_from_statement(statement, column_names)
-        })
-    }
-
-    #[cfg(feature = "offline")]
-    fn describe(
-        &mut self,
-        sql: SqlStr,
-    ) -> BoxFuture<'_, sqlx_core::Result<sqlx_core::describe::Describe<sqlx_core::any::Any>>> {
-        Box::pin(async move { Executor::describe(self, sql).await?.try_into_any() })
     }
 }
 

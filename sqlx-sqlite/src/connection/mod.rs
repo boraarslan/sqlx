@@ -17,10 +17,12 @@ use libsqlite3_sys::{
 pub use preupdate_hook::*;
 
 pub(crate) use handle::ConnectionHandle;
+pub(crate) use service::SqliteDriver;
 use sqlx_core::common::StatementCache;
 pub(crate) use sqlx_core::connection::*;
 use sqlx_core::error::Error;
 use sqlx_core::executor::Executor;
+use sqlx_core::middleware::{BoxService, ConnectionService, Layers, Request, Response, Service};
 use sqlx_core::sql_str::{AssertSqlSafe, SqlSafeStr};
 use sqlx_core::transaction::Transaction;
 
@@ -40,6 +42,7 @@ mod handle;
 pub(crate) mod intmap;
 #[cfg(feature = "preupdate-hook")]
 mod preupdate_hook;
+mod service;
 
 #[cfg(feature = "deserialize")]
 pub(crate) mod deserialize;
@@ -64,6 +67,7 @@ pub struct SqliteConnection {
     optimize_on_close: OptimizeOnClose,
     pub(crate) worker: ConnectionWorker,
     pub(crate) row_channel_size: usize,
+    pub(crate) service: ConnectionService<Sqlite, SqliteDriver>,
 }
 
 pub struct LockedSqliteHandle<'a> {
@@ -189,11 +193,30 @@ impl SqliteConnection {
     pub(crate) async fn establish(options: &SqliteConnectOptions) -> Result<Self, Error> {
         let params = EstablishParams::from_options(options)?;
         let worker = ConnectionWorker::establish(params).await?;
+
+        let driver = SqliteDriver {
+            worker: worker.clone(),
+            row_channel_size: options.row_channel_size,
+        };
+
+        // Middleware is installed once the connection is fully initialized.
+        // See `install_layers()`.
         Ok(Self {
             optimize_on_close: options.optimize_on_close.clone(),
             worker,
             row_channel_size: options.row_channel_size,
+            service: ConnectionService::new(driver, &Layers::new()),
         })
+    }
+
+    /// Wrap the connection in the middleware layers from its options.
+    pub(crate) fn install_layers(&mut self, layers: &Layers<BoxService<Sqlite>>) {
+        let driver = SqliteDriver {
+            worker: self.worker.clone(),
+            row_channel_size: self.row_channel_size,
+        };
+
+        self.service = ConnectionService::new(driver, layers);
     }
 
     /// Lock the SQLite database handle out from the worker thread so direct SQLite API calls can
@@ -204,6 +227,28 @@ impl SqliteConnection {
         let guard = self.worker.unlock_db().await?;
 
         Ok(LockedSqliteHandle { guard })
+    }
+}
+
+/// Sends requests through the middleware stack of this connection.
+///
+/// See the [`middleware`][sqlx_core::middleware] module for details.
+impl Service<Request<Sqlite>> for SqliteConnection {
+    type Response = Response<Sqlite>;
+    type Error = Error;
+    type Future = futures_core::future::BoxFuture<'static, Result<Response<Sqlite>, Error>>;
+
+    #[inline]
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.service.poll_ready(cx)
+    }
+
+    #[inline]
+    fn call(&mut self, request: Request<Sqlite>) -> Self::Future {
+        self.service.call(request)
     }
 }
 

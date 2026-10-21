@@ -1,9 +1,10 @@
-use crate::{SqliteConnectOptions, SqliteConnection};
+use crate::{Sqlite, SqliteConnectOptions, SqliteConnection};
 use log::LevelFilter;
 use sqlx_core::config;
 use sqlx_core::connection::ConnectOptions;
 use sqlx_core::error::Error;
 use sqlx_core::executor::Executor;
+use sqlx_core::middleware::{BoxService, Layers};
 use sqlx_core::sql_str::AssertSqlSafe;
 use std::fmt::Write;
 use std::str::FromStr;
@@ -46,6 +47,8 @@ impl ConnectOptions for SqliteConnectOptions {
             }
         }
 
+        conn.install_layers(&self.layers);
+
         Ok(conn)
     }
 
@@ -57,6 +60,14 @@ impl ConnectOptions for SqliteConnectOptions {
     fn log_slow_statements(mut self, level: LevelFilter, duration: Duration) -> Self {
         self.log_settings.log_slow_statements(level, duration);
         self
+    }
+
+    fn layers(&self) -> &Layers<BoxService<Sqlite>> {
+        &self.layers
+    }
+
+    fn layers_mut(&mut self) -> &mut Layers<BoxService<Sqlite>> {
+        &mut self.layers
     }
 
     fn __unstable_apply_driver_config(

@@ -7,7 +7,10 @@ mod connect;
 mod parse;
 mod ssl_mode;
 
-use crate::{connection::LogSettings, net::tls::CertificateInput};
+use crate::{connection::LogSettings, net::tls::CertificateInput, MySql};
+use sqlx_core::connection::ConnectOptions;
+use sqlx_core::error::BoxDynError;
+use sqlx_core::middleware::{BoxService, Layer, Layers, Request, Response, Service};
 use sqlx_core::net::tls::TlsConnector;
 pub use ssl_mode::MySqlSslMode;
 
@@ -82,6 +85,7 @@ pub struct MySqlConnectOptions {
     pub(crate) timezone: Option<String>,
     pub(crate) set_names: bool,
     pub(crate) found_rows: bool,
+    pub(crate) layers: Layers<BoxService<MySql>>,
 }
 
 impl Default for MySqlConnectOptions {
@@ -126,7 +130,24 @@ impl MySqlConnectOptions {
             timezone: Some(String::from("+00:00")),
             set_names: true,
             found_rows: true,
+            layers: Layers::new(),
         }
+    }
+
+    /// Add a [Tower] middleware [`Layer`] to every connection made with these options.
+    ///
+    /// See [`ConnectOptions::layer()`][sqlx_core::connection::ConnectOptions::layer]
+    /// and the [`middleware`][sqlx_core::middleware] module for details.
+    ///
+    /// [Tower]: https://docs.rs/tower
+    pub fn layer<L>(self, layer: L) -> Self
+    where
+        L: Layer<BoxService<MySql>> + Send + Sync + 'static,
+        L::Service: Service<Request<MySql>, Response = Response<MySql>> + Send + 'static,
+        <L::Service as Service<Request<MySql>>>::Error: Into<BoxDynError> + 'static,
+        <L::Service as Service<Request<MySql>>>::Future: Send + 'static,
+    {
+        ConnectOptions::layer(self, layer)
     }
 
     /// Sets the name of the host to connect to.

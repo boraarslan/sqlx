@@ -1,11 +1,12 @@
 use crate::database::Database;
 use crate::error::{BoxDynError, Error};
+use crate::middleware::{Extensions, Request, RequestKind, Response};
 use crate::sql_str::{SqlSafeStr, SqlStr};
 
 use either::Either;
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
-use futures_util::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures_util::{stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use std::{fmt::Debug, future};
 
 /// A type that contains or can provide a database
@@ -52,6 +53,22 @@ use std::{fmt::Debug, future};
 /// [`sqlx::raw_sql()`]: crate::raw_sql::raw_sql
 pub trait Executor<'c>: Send + Debug + Sized {
     type Database: Database;
+
+    /// Send a [`Request`] through this executor's middleware stack to the database.
+    ///
+    /// This is the only required method; all other methods are implemented in terms of it.
+    ///
+    /// The returned future completes when the database starts responding; the rows of a query
+    /// are then streamed through the [`ResultStream`][crate::middleware::ResultStream]
+    /// in the [`Response`].
+    ///
+    /// See the [`middleware`][crate::middleware] module for details.
+    fn dispatch<'e>(
+        self,
+        request: Request<Self::Database>,
+    ) -> BoxFuture<'e, Result<Response<Self::Database>, Error>>
+    where
+        'c: 'e;
 
     /// Execute the query and return the total number of rows affected.
     fn execute<'e, 'q: 'e, E>(
@@ -117,7 +134,18 @@ pub trait Executor<'c>: Send + Debug + Sized {
     >
     where
         'c: 'e,
-        E: 'q + Execute<'q, Self::Database>;
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        let request = match Request::from_execute(query, RequestKind::Fetch) {
+            Ok(request) => request,
+            Err(e) => return stream::once(future::ready(Err(e))).boxed(),
+        };
+
+        self.dispatch(request)
+            .and_then(|response| future::ready(response.into_stream()))
+            .try_flatten_stream()
+            .boxed()
+    }
 
     /// Execute the query and return all the generated results, collected into a [`Vec`].
     fn fetch_all<'e, 'q: 'e, E>(
@@ -151,13 +179,41 @@ pub trait Executor<'c>: Send + Debug + Sized {
     }
 
     /// Execute the query and returns at most one row.
+    ///
+    /// Drivers may stop reading rows after the first, but any errors which occur before then
+    /// (including from rows which are discarded) are returned.
     fn fetch_optional<'e, 'q: 'e, E>(
         self,
         query: E,
     ) -> BoxFuture<'e, Result<Option<<Self::Database as Database>::Row>, Error>>
     where
         'c: 'e,
-        E: 'q + Execute<'q, Self::Database>;
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        let request = Request::from_execute(query, RequestKind::FetchOptional);
+
+        let response = match request {
+            Ok(request) => self.dispatch(request),
+            Err(e) => return future::ready(Err(e)).boxed(),
+        };
+
+        Box::pin(async move {
+            let mut stream = response.await?.into_stream()?;
+            let mut first = None;
+
+            // Read the whole stream so that errors (e.g. deferred constraint violations)
+            // are not silently dropped; drivers may end the stream early for `FetchOptional`.
+            while let Some(item) = stream.try_next().await? {
+                if let Either::Right(row) = item {
+                    if first.is_none() {
+                        first = Some(row);
+                    }
+                }
+            }
+
+            Ok(first)
+        })
+    }
 
     /// Prepare the SQL query to inspect the type information of its parameters
     /// and results.
@@ -189,7 +245,12 @@ pub trait Executor<'c>: Send + Debug + Sized {
         parameters: &'e [<Self::Database as Database>::TypeInfo],
     ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement, Error>>
     where
-        'c: 'e;
+        'c: 'e,
+    {
+        self.dispatch(Request::prepare(sql, parameters.to_vec()))
+            .and_then(|response| future::ready(response.into_statement()))
+            .boxed()
+    }
 
     /// Describe the SQL query and return type information about its parameters
     /// and results.
@@ -203,7 +264,12 @@ pub trait Executor<'c>: Send + Debug + Sized {
         sql: SqlStr,
     ) -> BoxFuture<'e, Result<crate::describe::Describe<Self::Database>, Error>>
     where
-        'c: 'e;
+        'c: 'e,
+    {
+        self.dispatch(Request::new(RequestKind::Describe, sql))
+            .and_then(|response| future::ready(response.into_describe()))
+            .boxed()
+    }
 }
 
 /// A type that may be executed against a database connection.
@@ -231,6 +297,14 @@ pub trait Execute<'q, DB: Database>: Send + Sized {
 
     /// Returns `true` if the statement should be cached.
     fn persistent(&self) -> bool;
+
+    /// Returns values to attach to the [`Request`] as [`Extensions`] for use by middleware.
+    ///
+    /// Returns an empty map by default.
+    #[inline]
+    fn take_extensions(&mut self) -> Extensions {
+        Extensions::new()
+    }
 }
 
 impl<DB: Database, T> Execute<'_, DB> for T

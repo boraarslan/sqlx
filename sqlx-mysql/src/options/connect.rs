@@ -1,8 +1,9 @@
 use crate::connection::ConnectOptions;
 use crate::error::Error;
 use crate::executor::Executor;
-use crate::{MySqlConnectOptions, MySqlConnection};
+use crate::{MySql, MySqlConnectOptions, MySqlConnection};
 use log::LevelFilter;
+use sqlx_core::middleware::{BoxService, Layers};
 use sqlx_core::sql_str::AssertSqlSafe;
 use sqlx_core::Url;
 use std::time::Duration;
@@ -88,6 +89,8 @@ impl ConnectOptions for MySqlConnectOptions {
                 .await?;
         }
 
+        conn.install_layers(&self.layers);
+
         Ok(conn)
     }
 
@@ -99,5 +102,13 @@ impl ConnectOptions for MySqlConnectOptions {
     fn log_slow_statements(mut self, level: LevelFilter, duration: Duration) -> Self {
         self.log_settings.log_slow_statements(level, duration);
         self
+    }
+
+    fn layers(&self) -> &Layers<BoxService<MySql>> {
+        &self.layers
+    }
+
+    fn layers_mut(&mut self) -> &mut Layers<BoxService<MySql>> {
+        &mut self.layers
     }
 }

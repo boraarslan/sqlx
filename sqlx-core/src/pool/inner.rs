@@ -3,6 +3,7 @@ use crate::connection::ConnectOptions;
 use crate::connection::Connection;
 use crate::database::Database;
 use crate::error::Error;
+use crate::middleware::BoxCloneService;
 use crate::pool::{deadline_as_timeout, CloseEvent, Pool, PoolOptions};
 use crossbeam_queue::ArrayQueue;
 
@@ -12,7 +13,7 @@ use std::cmp;
 use std::future::{self, Future};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::task::Poll;
 
 use crate::logger::private_level_filter_to_trace_level;
@@ -33,6 +34,9 @@ pub(crate) struct PoolInner<DB: Database> {
     pub(super) options: PoolOptions<DB>,
     pub(crate) acquire_time_level: Option<Level>,
     pub(crate) acquire_slow_level: Option<Level>,
+    /// The middleware stack built from `options.layers`, initialized on first use.
+    /// `None` if there are no layers.
+    pub(super) service: OnceLock<Option<BoxCloneService<DB>>>,
 }
 
 impl<DB: Database> PoolInner<DB> {
@@ -62,6 +66,7 @@ impl<DB: Database> PoolInner<DB> {
             acquire_time_level: private_level_filter_to_trace_level(options.acquire_time_level),
             acquire_slow_level: private_level_filter_to_trace_level(options.acquire_slow_level),
             options,
+            service: OnceLock::new(),
         };
 
         let pool = Arc::new(pool);

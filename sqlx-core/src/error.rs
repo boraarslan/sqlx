@@ -124,6 +124,18 @@ pub enum Error {
     #[error("got unexpected connection status after attempting to begin transaction")]
     BeginFailed,
 
+    /// An error returned by middleware.
+    ///
+    /// Errors which are already an [`Error`] (e.g. errors returned by the database)
+    /// pass through middleware unchanged; any other error is wrapped in this variant.
+    ///
+    /// For example, `tower::timeout::Timeout` returns `tower::timeout::error::Elapsed`
+    /// when the timeout expires.
+    ///
+    /// See the [`middleware`][crate::middleware] module for details.
+    #[error("error returned from middleware: {0}")]
+    Middleware(#[source] BoxDynError),
+
     // Not returned in normal operation.
     /// Error occurred while reading configuration file
     #[doc(hidden)]

@@ -2,7 +2,7 @@ use bytes::buf::Buf;
 use bytes::Bytes;
 
 use crate::common::StatementCache;
-use crate::connection::{tls, MySqlConnectionInner, MySqlStream, MAX_PACKET_SIZE};
+use crate::connection::{tls, MySqlConn, MySqlConnectionInner, MySqlStream, MAX_PACKET_SIZE};
 use crate::error::Error;
 use crate::net::{Socket, WithSocket};
 use crate::protocol::connect::{
@@ -22,15 +22,14 @@ impl MySqlConnection {
 
         let stream = handshake?;
 
-        Ok(Self {
-            inner: Box::new(MySqlConnectionInner {
+        Ok(Self::new(MySqlConn {
+            inner: MySqlConnectionInner {
                 stream,
-                transaction_depth: 0,
                 status_flags: Default::default(),
                 cache_statement: StatementCache::new(options.statement_cache_capacity),
                 log_settings: options.log_settings.clone(),
-            }),
-        })
+            },
+        }))
     }
 }
 

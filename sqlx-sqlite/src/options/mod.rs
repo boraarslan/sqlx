@@ -18,6 +18,10 @@ pub use synchronous::SqliteSynchronous;
 
 use crate::common::DebugFn;
 use crate::connection::collation::Collation;
+use crate::Sqlite;
+use sqlx_core::connection::ConnectOptions;
+use sqlx_core::error::BoxDynError;
+use sqlx_core::middleware::{BoxService, Layer, Layers, Request, Response, Service};
 use sqlx_core::{config, IndexMap};
 
 /// Options and flags which can be used to configure a SQLite connection.
@@ -92,6 +96,8 @@ pub struct SqliteConnectOptions {
 
     #[cfg(feature = "regexp")]
     pub(crate) register_regexp_function: bool,
+
+    pub(crate) layers: Layers<BoxService<Sqlite>>,
 }
 
 #[derive(Clone, Debug)]
@@ -215,7 +221,24 @@ impl SqliteConnectOptions {
             optimize_on_close: OptimizeOnClose::Disabled,
             #[cfg(feature = "regexp")]
             register_regexp_function: false,
+            layers: Layers::new(),
         }
+    }
+
+    /// Add a [Tower] middleware [`Layer`] to every connection made with these options.
+    ///
+    /// See [`ConnectOptions::layer()`][sqlx_core::connection::ConnectOptions::layer]
+    /// and the [`middleware`][sqlx_core::middleware] module for details.
+    ///
+    /// [Tower]: https://docs.rs/tower
+    pub fn layer<L>(self, layer: L) -> Self
+    where
+        L: Layer<BoxService<Sqlite>> + Send + Sync + 'static,
+        L::Service: Service<Request<Sqlite>, Response = Response<Sqlite>> + Send + 'static,
+        <L::Service as Service<Request<Sqlite>>>::Error: Into<BoxDynError> + 'static,
+        <L::Service as Service<Request<Sqlite>>>::Future: Send + 'static,
+    {
+        ConnectOptions::layer(self, layer)
     }
 
     /// Sets the name of the database file.
