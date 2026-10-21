@@ -71,7 +71,11 @@ impl ConnectOptions for SqliteConnectOptions {
     }
 
     fn connection_info(&self) -> ConnectionInfo {
-        ConnectionInfo::new().with_database(self.filename.to_string_lossy())
+        if self.in_memory {
+            ConnectionInfo::new().with_database(":memory:")
+        } else {
+            ConnectionInfo::new().with_database(self.filename.to_string_lossy())
+        }
     }
 
     fn __unstable_apply_driver_config(

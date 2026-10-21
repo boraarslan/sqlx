@@ -320,6 +320,11 @@ path = "tests/sqlite/sqlite.rs"
 required-features = ["sqlite"]
 
 [[test]]
+name = "sqlite-middleware"
+path = "tests/sqlite/middleware.rs"
+required-features = ["sqlite"]
+
+[[test]]
 name = "sqlite-any"
 path = "tests/sqlite/any.rs"
 required-features = ["sqlite", "any"]
@@ -422,6 +427,11 @@ required-features = ["mysql", "macros", "migrate"]
 [[test]]
 name = "mysql-rustsec"
 path = "tests/mysql/rustsec.rs"
+required-features = ["mysql"]
+
+[[test]]
+name = "mysql-middleware"
+path = "tests/mysql/middleware.rs"
 required-features = ["mysql"]
 
 [[test]]

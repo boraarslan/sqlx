@@ -1,7 +1,8 @@
 use crate::any::{Any, AnyConnection};
 use crate::connection::{ConnectOptions, LogSettings};
+use crate::error::BoxDynError;
 use crate::error::Error;
-use crate::middleware::{BoxService, ConnectionInfo, Layers};
+use crate::middleware::{BoxService, ConnectionInfo, Layer, Layers, Request, Response, Service};
 use log::LevelFilter;
 use std::future::Future;
 use std::str::FromStr;
@@ -101,4 +102,19 @@ impl ConnectOptions for AnyConnectOptions {
     }
 }
 
-impl AnyConnectOptions {}
+impl AnyConnectOptions {
+    /// Add a [Tower] middleware [`Layer`] to every connection made with these options.
+    ///
+    /// See [`ConnectOptions::layer()`] and the [`middleware`][crate::middleware] module for details.
+    ///
+    /// [Tower]: https://docs.rs/tower
+    pub fn layer<L>(self, layer: L) -> Self
+    where
+        L: Layer<BoxService<Any>> + Send + Sync + 'static,
+        L::Service: Service<Request<Any>, Response = Response<Any>> + Send + 'static,
+        <L::Service as Service<Request<Any>>>::Error: Into<BoxDynError> + 'static,
+        <L::Service as Service<Request<Any>>>::Future: Send + 'static,
+    {
+        ConnectOptions::layer(self, layer)
+    }
+}
