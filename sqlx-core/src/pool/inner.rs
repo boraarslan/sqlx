@@ -669,16 +669,12 @@ impl<DB: Database> Drop for DecrementSizeGuard<DB> {
 #[cfg(all(test, feature = "any"))]
 mod underflow_tests {
     use super::*;
-    use crate::any::{
-        Any, AnyArguments, AnyConnectOptions, AnyConnection, AnyConnectionBackend, AnyQueryResult,
-        AnyRow, AnyStatement, AnyTypeInfo,
-    };
+    use crate::any::{Any, AnyConnectOptions, AnyConnection, AnyConnectionBackend};
+    use crate::middleware::{ConnectionService, Layers, Request, Response, Service};
     use crate::pool::Pool;
-    use crate::sql_str::SqlStr;
-    use either::Either;
     use futures_core::future::BoxFuture;
-    use futures_core::stream::BoxStream;
     use std::str::FromStr;
+    use std::task::Context;
 
     /// A backend that constructs but never executes anything. The pool's `release`/`pop_idle`
     /// paths only move the opaque connection around — they never call any of these methods.
@@ -698,14 +694,8 @@ mod underflow_tests {
         fn ping(&mut self) -> BoxFuture<'_, crate::Result<()>> {
             unimplemented!()
         }
-        fn begin(&mut self, _statement: Option<SqlStr>) -> BoxFuture<'_, crate::Result<()>> {
-            unimplemented!()
-        }
-        fn commit(&mut self) -> BoxFuture<'_, crate::Result<()>> {
-            unimplemented!()
-        }
-        fn rollback(&mut self) -> BoxFuture<'_, crate::Result<()>> {
-            unimplemented!()
+        fn service(&mut self) -> BoxService<Any> {
+            BoxService::new(StubService)
         }
         fn start_rollback(&mut self) {
             unimplemented!()
@@ -719,34 +709,24 @@ mod underflow_tests {
         fn should_flush(&self) -> bool {
             unimplemented!()
         }
-        fn fetch_many(
-            &mut self,
-            _query: SqlStr,
-            _persistent: bool,
-            _arguments: Option<AnyArguments>,
-        ) -> BoxStream<'_, crate::Result<Either<AnyQueryResult, AnyRow>>> {
-            unimplemented!()
+        fn get_transaction_depth(&self) -> usize {
+            0
         }
-        fn fetch_optional(
-            &mut self,
-            _query: SqlStr,
-            _persistent: bool,
-            _arguments: Option<AnyArguments>,
-        ) -> BoxFuture<'_, crate::Result<Option<AnyRow>>> {
-            unimplemented!()
+    }
+
+    /// The request service of [`StubBackend`], which never executes anything either.
+    struct StubService;
+
+    impl Service<Request<Any>> for StubService {
+        type Response = Response<Any>;
+        type Error = Error;
+        type Future = BoxFuture<'static, crate::Result<Response<Any>>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+            Poll::Ready(Ok(()))
         }
-        fn prepare_with<'c, 'q: 'c>(
-            &'c mut self,
-            _sql: SqlStr,
-            _parameters: &[AnyTypeInfo],
-        ) -> BoxFuture<'c, crate::Result<AnyStatement>> {
-            unimplemented!()
-        }
-        #[cfg(feature = "offline")]
-        fn describe(
-            &mut self,
-            _sql: SqlStr,
-        ) -> BoxFuture<'_, crate::Result<crate::describe::Describe<Any>>> {
+
+        fn call(&mut self, _request: Request<Any>) -> Self::Future {
             unimplemented!()
         }
     }
@@ -761,9 +741,13 @@ mod underflow_tests {
             .try_acquire(1)
             .expect("a permit should be available");
         let guard = DecrementSizeGuard::from_permit(Arc::clone(inner), permit);
-        let conn = AnyConnection {
-            backend: Box::new(StubBackend),
-        };
+        let mut backend: Box<dyn AnyConnectionBackend> = Box::new(StubBackend);
+        let service = ConnectionService::new(
+            backend.service(),
+            &Layers::new(),
+            Arc::new(ConnectionInfo::default()),
+        );
+        let conn = AnyConnection { backend, service };
         Floating::new_live(conn, guard)
     }
 

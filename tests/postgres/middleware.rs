@@ -8,7 +8,7 @@ use sqlx::middleware::{
     ServiceExecutor,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, Postgres};
-use sqlx::{Connection, Database, Error, Executor, Row};
+use sqlx::{Connection, Database, Error, Executor};
 use sqlx_test::setup_if_needed;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -583,8 +583,8 @@ async fn it_serializes_requests_while_a_response_is_detached() -> anyhow::Result
     let mut conn = PgConnection::connect_with(&connect_options()?.layer(layer)).await?;
 
     // Only read part of the response, leaving the background task holding the connection.
-    let mut rows = sqlx::query("SELECT generate_series(1, 100)").fetch(&mut conn);
-    let first: i32 = rows.next().await.unwrap()?.try_get(0)?;
+    let mut rows = sqlx::query_scalar::<_, i32>("SELECT generate_series(1, 100)").fetch(&mut conn);
+    let first = rows.next().await.unwrap()?;
     assert_eq!(first, 1);
     drop(rows);
 
@@ -1271,18 +1271,27 @@ async fn it_detects_transaction_requests_which_did_not_reach_the_database() -> a
 async fn it_rebuilds_the_stack_when_a_request_is_cancelled_while_waiting() -> anyhow::Result<()> {
     use tower::limit::GlobalConcurrencyLimitLayer;
 
-    // One query at a time across both connections.
-    let limit = GlobalConcurrencyLimitLayer::new(1);
-    let options = connect_options()?.layer(limit);
+    // One query at a time across both connections. `started` is notified when a query got
+    // its permit.
+    let started = Arc::new(tokio::sync::Notify::new());
+    let options = connect_options()?
+        .layer(GlobalConcurrencyLimitLayer::new(1))
+        .layer(middleware::from_fn({
+            let started = started.clone();
+            move |request: Request<Postgres>, next: Next<Postgres>| {
+                started.notify_one();
+                next.run(request)
+            }
+        }));
 
     let mut a = PgConnection::connect_with(&options).await?;
     let mut b = PgConnection::connect_with(&options).await?;
 
     let slow = tokio::spawn(async move {
-        a.execute("SELECT pg_sleep(0.3)").await?;
+        a.execute("SELECT pg_sleep(0.5)").await?;
         anyhow::Ok(a)
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    started.notified().await;
 
     // Gives up while waiting for the permit, which `a` holds.
     tokio::time::timeout(Duration::from_millis(50), b.execute("SELECT 1"))
@@ -1301,20 +1310,29 @@ async fn it_rebuilds_the_stack_when_a_request_is_cancelled_while_waiting() -> an
 #[sqlx_macros::test]
 async fn it_closes_pooled_connections_left_in_a_transaction() -> anyhow::Result<()> {
     // Starts transactions in the background, and doesn't wait for them.
-    let layer = middleware::from_fn(
-        |request: Request<Postgres>, next: Next<Postgres>| async move {
-            if request.kind() == RequestKind::Begin {
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    let _ = next.run(request).await;
-                });
+    // `begun` is notified when such a transaction was started.
+    let begun = Arc::new(tokio::sync::Notify::new());
+    let layer = middleware::from_fn({
+        let begun = begun.clone();
+        move |request: Request<Postgres>, next: Next<Postgres>| {
+            let begun = begun.clone();
 
-                return Err(Error::Protocol("detached".into()));
+            async move {
+                if request.kind() == RequestKind::Begin {
+                    tokio::spawn(async move {
+                        // Start the transaction after the connection was returned to the pool.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let _ = next.run(request).await;
+                        begun.notify_one();
+                    });
+
+                    return Err(Error::Protocol("detached".into()));
+                }
+
+                next.run(request).await
             }
-
-            next.run(request).await
-        },
-    );
+        }
+    });
 
     let pool = PgPoolOptions::new()
         .max_connections(1)
@@ -1322,9 +1340,7 @@ async fn it_closes_pooled_connections_left_in_a_transaction() -> anyhow::Result<
         .await?;
 
     pool.begin().await.unwrap_err();
-
-    // The `BEGIN` runs on the idle connection.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::timeout(Duration::from_secs(10), begun.notified()).await?;
 
     let mut conn = pool.acquire().await?;
     assert!(!conn.is_in_transaction());
