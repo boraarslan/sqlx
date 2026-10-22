@@ -53,11 +53,7 @@ impl WorkerSharedState {
     }
 
     fn decrement_transaction_depth(&self) {
-        let _ = self
-            .transaction_depth
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
-                depth.checked_sub(1)
-            });
+        sqlx_core::common::decrement_nonzero(&self.transaction_depth);
     }
 
     pub(crate) fn get_cached_statements_size(&self) -> usize {

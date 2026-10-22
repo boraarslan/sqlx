@@ -161,11 +161,7 @@ impl MySqlConnectionState {
 
     /// Decrement the transaction depth if it's not zero, returning the previous depth.
     pub(crate) fn decrement_transaction_depth(&self) -> Option<usize> {
-        self.transaction_depth
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
-                depth.checked_sub(1)
-            })
-            .ok()
+        crate::common::decrement_nonzero(&self.transaction_depth)
     }
 
     /// Queue a `ROLLBACK` of the current transaction or savepoint, if any,

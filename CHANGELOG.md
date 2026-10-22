@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `legacy_attributes(true)` also records the pre-stable names (`db.system`, `db.statement`, `db.name`), which
     Datadog uses to identify SQL spans.
   * `Query::extension()` (and on `QueryAs`, `QueryScalar` and `Map`) attaches values to the request for middleware.
+    They reach the request through the new provided method `Execute::take_extensions()`, which custom `Execute`
+    implementations that wrap a query should forward.
   * `Request::connection_info()` describes the database a request is sent to (from the new
     `ConnectOptions::connection_info()`), and `Request::transaction_depth()` the transaction state of the connection.
 

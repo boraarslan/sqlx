@@ -273,7 +273,8 @@ fn connect_span<DB: Database>(request: &ConnectRequest<DB>, legacy_attributes: b
         db.system.name = &*system,
         db.namespace = Empty,
         db.response.status_code = Empty,
-        error.type = Empty,
+        // Quoted, as `type` is a keyword (which needs tracing 0.1.41 otherwise).
+        "error.type" = Empty,
         server.address = Empty,
         server.port = Empty,
         db.system = Empty,
@@ -333,7 +334,8 @@ fn request_span<DB: Database>(
         db.query.summary = summary,
         db.response.returned_rows = Empty,
         db.response.status_code = Empty,
-        error.type = Empty,
+        // Quoted, as `type` is a keyword (which needs tracing 0.1.41 otherwise).
+        "error.type" = Empty,
         server.address = Empty,
         server.port = Empty,
         sqlx.request.kind = request.kind().as_str(),
