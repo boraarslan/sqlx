@@ -1,11 +1,12 @@
 use crate::database::Database;
 use crate::error::{BoxDynError, Error};
+use crate::middleware::{Extensions, Request, RequestKind, Response};
 use crate::sql_str::{SqlSafeStr, SqlStr};
 
 use either::Either;
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
-use futures_util::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures_util::{stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use std::{fmt::Debug, future};
 
 /// A type that contains or can provide a database
@@ -21,6 +22,13 @@ use std::{fmt::Debug, future};
 ///
 ///  * [`&Pool`](super::pool::Pool)
 ///  * [`&mut Connection`](super::connection::Connection)
+///  * [`&mut ServiceExecutor`](crate::middleware::ServiceExecutor), which wraps any
+///    [middleware](crate::middleware) stack.
+///
+/// # Middleware
+/// All methods of this trait are implemented on top of [`dispatch()`][Self::dispatch], which
+/// sends a [`Request`] through the [middleware](crate::middleware) stack of the
+/// connection or pool. To implement this trait, only `dispatch()` needs to be implemented.
 ///
 /// The [`Executor`] impls for [`Transaction`](crate::transaction::Transaction)
 /// and [`PoolConnection`](crate::pool::PoolConnection) have been deleted because they
@@ -52,6 +60,40 @@ use std::{fmt::Debug, future};
 /// [`sqlx::raw_sql()`]: crate::raw_sql::raw_sql
 pub trait Executor<'c>: Send + Debug + Sized {
     type Database: Database;
+
+    /// Send a [`Request`] through this executor's middleware stack to the database.
+    ///
+    /// All other methods are implemented in terms of this one, so it's the only method
+    /// implementations need to provide.
+    ///
+    /// The returned future completes when the database starts responding; the rows of a query
+    /// are then streamed through the [`ResultStream`][crate::middleware::ResultStream]
+    /// in the [`Response`].
+    ///
+    /// See the [`middleware`][crate::middleware] module for details.
+    ///
+    /// # Compatibility
+    /// To keep implementations written before this method was added working, the default
+    /// implementation returns an error. Such implementations must override
+    /// [`fetch_many()`][Self::fetch_many], [`fetch_optional()`][Self::fetch_optional],
+    /// [`prepare_with()`][Self::prepare_with] and `describe()`; they cannot be used with
+    /// [`ServiceExecutor`][crate::middleware::ServiceExecutor] or other APIs that call `dispatch()`.
+    /// In particular, a [`Pool`][crate::pool::Pool] of connections whose `Executor` doesn't
+    /// implement `dispatch()` only works if no [pool middleware][crate::pool::PoolOptions::layer]
+    /// is configured.
+    fn dispatch<'e>(
+        self,
+        request: Request<Self::Database>,
+    ) -> BoxFuture<'e, Result<Response<Self::Database>, Error>>
+    where
+        'c: 'e,
+    {
+        Box::pin(future::ready(Err(Error::InvalidArgument(format!(
+            "`Executor::dispatch()` is not implemented for {}; cannot execute {:?}",
+            std::any::type_name::<Self>(),
+            request.kind()
+        )))))
+    }
 
     /// Execute the query and return the total number of rows affected.
     fn execute<'e, 'q: 'e, E>(
@@ -117,7 +159,10 @@ pub trait Executor<'c>: Send + Debug + Sized {
     >
     where
         'c: 'e,
-        E: 'q + Execute<'q, Self::Database>;
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        provided::fetch_many(self, query)
+    }
 
     /// Execute the query and return all the generated results, collected into a [`Vec`].
     fn fetch_all<'e, 'q: 'e, E>(
@@ -151,13 +196,19 @@ pub trait Executor<'c>: Send + Debug + Sized {
     }
 
     /// Execute the query and returns at most one row.
+    ///
+    /// Drivers may stop reading the response after the first row; any error received up to
+    /// that point is returned, even if it follows the first row.
     fn fetch_optional<'e, 'q: 'e, E>(
         self,
         query: E,
     ) -> BoxFuture<'e, Result<Option<<Self::Database as Database>::Row>, Error>>
     where
         'c: 'e,
-        E: 'q + Execute<'q, Self::Database>;
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        provided::fetch_optional(self, query)
+    }
 
     /// Prepare the SQL query to inspect the type information of its parameters
     /// and results.
@@ -189,7 +240,10 @@ pub trait Executor<'c>: Send + Debug + Sized {
         parameters: &'e [<Self::Database as Database>::TypeInfo],
     ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement, Error>>
     where
-        'c: 'e;
+        'c: 'e,
+    {
+        provided::prepare_with(self, sql, parameters)
+    }
 
     /// Describe the SQL query and return type information about its parameters
     /// and results.
@@ -203,7 +257,107 @@ pub trait Executor<'c>: Send + Debug + Sized {
         sql: SqlStr,
     ) -> BoxFuture<'e, Result<crate::describe::Describe<Self::Database>, Error>>
     where
-        'c: 'e;
+        'c: 'e,
+    {
+        provided::describe(self, sql)
+    }
+}
+
+/// The provided implementations of the methods of [`Executor`] which send requests with
+/// [`Executor::dispatch()`].
+pub(crate) mod provided {
+    use super::*;
+
+    pub(crate) fn fetch_many<'c, 'e, 'q, X, E>(
+        executor: X,
+        query: E,
+    ) -> BoxStream<
+        'e,
+        Result<
+            Either<<X::Database as Database>::QueryResult, <X::Database as Database>::Row>,
+            Error,
+        >,
+    >
+    where
+        X: Executor<'c>,
+        'c: 'e,
+        'q: 'e,
+        E: 'q + Execute<'q, X::Database>,
+    {
+        let request = match Request::from_execute(query, RequestKind::Fetch) {
+            Ok(request) => request,
+            Err(e) => return stream::once(future::ready(Err(e))).boxed(),
+        };
+
+        executor
+            .dispatch(request)
+            .and_then(|response| future::ready(response.into_stream()))
+            .try_flatten_stream()
+            .boxed()
+    }
+
+    pub(crate) fn fetch_optional<'c, 'e, 'q, X, E>(
+        executor: X,
+        query: E,
+    ) -> BoxFuture<'e, Result<Option<<X::Database as Database>::Row>, Error>>
+    where
+        X: Executor<'c>,
+        'c: 'e,
+        'q: 'e,
+        E: 'q + Execute<'q, X::Database>,
+    {
+        let response = match Request::from_execute(query, RequestKind::FetchOptional) {
+            Ok(request) => executor.dispatch(request),
+            Err(e) => return future::ready(Err(e)).boxed(),
+        };
+
+        Box::pin(async move {
+            let mut stream = response.await?.into_stream()?;
+            let mut first = None;
+
+            // Read the whole stream so that errors (e.g. deferred constraint violations)
+            // are not silently dropped; drivers may end the stream early for `FetchOptional`.
+            while let Some(item) = stream.try_next().await? {
+                if let Either::Right(row) = item {
+                    if first.is_none() {
+                        first = Some(row);
+                    }
+                }
+            }
+
+            Ok(first)
+        })
+    }
+
+    pub(crate) fn prepare_with<'c, 'e, X>(
+        executor: X,
+        sql: SqlStr,
+        parameters: &'e [<X::Database as Database>::TypeInfo],
+    ) -> BoxFuture<'e, Result<<X::Database as Database>::Statement, Error>>
+    where
+        X: Executor<'c>,
+        'c: 'e,
+    {
+        executor
+            .dispatch(Request::prepare(sql, parameters.to_vec()))
+            .and_then(|response| future::ready(response.into_statement()))
+            .boxed()
+    }
+
+    #[cfg(feature = "offline")]
+    pub(crate) fn describe<'c, 'e, X>(
+        executor: X,
+        sql: SqlStr,
+    ) -> BoxFuture<'e, Result<crate::describe::Describe<X::Database>, Error>>
+    where
+        X: Executor<'c>,
+        'c: 'e,
+    {
+        executor
+            .dispatch(Request::new(RequestKind::Describe, sql))
+            .and_then(|response| future::ready(response.into_describe()))
+            .boxed()
+    }
 }
 
 /// A type that may be executed against a database connection.
@@ -231,6 +385,14 @@ pub trait Execute<'q, DB: Database>: Send + Sized {
 
     /// Returns `true` if the statement should be cached.
     fn persistent(&self) -> bool;
+
+    /// Returns values to attach to the [`Request`] as [`Extensions`] for use by middleware.
+    ///
+    /// Returns an empty map by default.
+    #[inline]
+    fn take_extensions(&mut self) -> Extensions {
+        Extensions::new()
+    }
 }
 
 impl<DB: Database, T> Execute<'_, DB> for T

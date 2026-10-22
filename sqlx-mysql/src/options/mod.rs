@@ -7,7 +7,13 @@ mod connect;
 mod parse;
 mod ssl_mode;
 
-use crate::{connection::LogSettings, net::tls::CertificateInput};
+use crate::{connection::LogSettings, net::tls::CertificateInput, MySql, MySqlConnection};
+use sqlx_core::connection::ConnectOptions;
+use sqlx_core::error::BoxDynError;
+use sqlx_core::middleware::{
+    BoxConnectService, BoxService, ConnectLayers, ConnectRequest, Layer, Layers, Request, Response,
+    Service,
+};
 use sqlx_core::net::tls::TlsConnector;
 pub use ssl_mode::MySqlSslMode;
 
@@ -82,6 +88,8 @@ pub struct MySqlConnectOptions {
     pub(crate) timezone: Option<String>,
     pub(crate) set_names: bool,
     pub(crate) found_rows: bool,
+    pub(crate) layers: Layers<BoxService<MySql>>,
+    pub(crate) connect_layers: ConnectLayers<MySql>,
 }
 
 impl Default for MySqlConnectOptions {
@@ -126,7 +134,41 @@ impl MySqlConnectOptions {
             timezone: Some(String::from("+00:00")),
             set_names: true,
             found_rows: true,
+            layers: Layers::new(),
+            connect_layers: ConnectLayers::new(),
         }
+    }
+
+    /// Add a [Tower] middleware [`Layer`] to every connection made with these options.
+    ///
+    /// See [`ConnectOptions::layer()`][sqlx_core::connection::ConnectOptions::layer]
+    /// and the [`middleware`][sqlx_core::middleware] module for details.
+    ///
+    /// [Tower]: https://docs.rs/tower
+    pub fn layer<L>(self, layer: L) -> Self
+    where
+        L: Layer<BoxService<MySql>> + Send + Sync + 'static,
+        L::Service: Service<Request<MySql>, Response = Response<MySql>> + Send + 'static,
+        <L::Service as Service<Request<MySql>>>::Error: Into<BoxDynError> + 'static,
+        <L::Service as Service<Request<MySql>>>::Future: Send + 'static,
+    {
+        ConnectOptions::layer(self, layer)
+    }
+
+    /// Add a [Tower] middleware [`Layer`] around opening connections with these options.
+    ///
+    /// See [`ConnectOptions::connect_layer()`][sqlx_core::connection::ConnectOptions::connect_layer]
+    /// and the [`middleware`][sqlx_core::middleware] module for details.
+    ///
+    /// [Tower]: https://docs.rs/tower
+    pub fn connect_layer<L>(self, layer: L) -> Self
+    where
+        L: Layer<BoxConnectService<MySql>> + Send + Sync + 'static,
+        L::Service: Service<ConnectRequest<MySql>, Response = MySqlConnection> + Send + 'static,
+        <L::Service as Service<ConnectRequest<MySql>>>::Error: Into<BoxDynError> + 'static,
+        <L::Service as Service<ConnectRequest<MySql>>>::Future: Send + 'static,
+    {
+        ConnectOptions::connect_layer(self, layer)
     }
 
     /// Sets the name of the host to connect to.

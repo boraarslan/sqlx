@@ -65,7 +65,7 @@ use event_listener::EventListener;
 use futures_core::FusedFuture;
 use futures_util::FutureExt;
 
-use crate::connection::Connection;
+use crate::connection::{ConnectOptions, Connection};
 use crate::database::Database;
 use crate::error::Error;
 use crate::sql_str::SqlSafeStr;
@@ -555,6 +555,8 @@ impl<DB: Database> Pool<DB> {
     /// Updates the connection options this pool will use when opening any future connections.  Any
     /// existing open connection in the pool will be left as-is.
     pub fn set_connect_options(&self, connect_options: <DB::Connection as Connection>::Options) {
+        let connection_info = Arc::new(connect_options.connection_info());
+
         // technically write() could also panic if the current thread already holds the lock,
         // but because this method can't be re-entered by the same thread that shouldn't be a problem
         let mut guard = self
@@ -563,6 +565,13 @@ impl<DB: Database> Pool<DB> {
             .write()
             .expect("write-lock holder panicked");
         *guard = Arc::new(connect_options);
+        drop(guard);
+
+        *self
+            .0
+            .connection_info
+            .write()
+            .expect("write-lock holder panicked") = connection_info;
     }
 
     /// Get the options for this pool

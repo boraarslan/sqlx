@@ -1,9 +1,10 @@
-use crate::{SqliteConnectOptions, SqliteConnection};
+use crate::{Sqlite, SqliteConnectOptions, SqliteConnection};
 use log::LevelFilter;
 use sqlx_core::config;
 use sqlx_core::connection::ConnectOptions;
 use sqlx_core::error::Error;
 use sqlx_core::executor::Executor;
+use sqlx_core::middleware::{BoxService, ConnectLayers, ConnectionInfo, Layers};
 use sqlx_core::sql_str::AssertSqlSafe;
 use std::fmt::Write;
 use std::str::FromStr;
@@ -33,6 +34,62 @@ impl ConnectOptions for SqliteConnectOptions {
     where
         Self::Connection: Sized,
     {
+        if self.connect_layers.is_empty() {
+            self.establish().await
+        } else {
+            self.connect_layers
+                .connect(self, |options| {
+                    Box::pin(async move { options.establish().await })
+                })
+                .await
+        }
+    }
+
+    fn log_statements(mut self, level: LevelFilter) -> Self {
+        self.log_settings.log_statements(level);
+        self
+    }
+
+    fn log_slow_statements(mut self, level: LevelFilter, duration: Duration) -> Self {
+        self.log_settings.log_slow_statements(level, duration);
+        self
+    }
+
+    fn layers(&self) -> &Layers<BoxService<Sqlite>> {
+        &self.layers
+    }
+
+    fn layers_mut(&mut self) -> &mut Layers<BoxService<Sqlite>> {
+        &mut self.layers
+    }
+
+    fn connect_layers(&self) -> &ConnectLayers<Sqlite> {
+        &self.connect_layers
+    }
+
+    fn connect_layers_mut(&mut self) -> &mut ConnectLayers<Sqlite> {
+        &mut self.connect_layers
+    }
+
+    fn connection_info(&self) -> ConnectionInfo {
+        if self.in_memory {
+            ConnectionInfo::new().with_database(":memory:")
+        } else {
+            ConnectionInfo::new().with_database(self.filename.to_string_lossy())
+        }
+    }
+
+    fn __unstable_apply_driver_config(
+        self,
+        config: &config::drivers::Config,
+    ) -> crate::Result<Self> {
+        self.apply_driver_config(&config.sqlite)
+    }
+}
+
+impl SqliteConnectOptions {
+    /// Open and initialize a connection, without going through connect middleware.
+    async fn establish(&self) -> Result<SqliteConnection, Error> {
         let mut conn = SqliteConnection::establish(self).await?;
 
         // Execute PRAGMAs
@@ -46,28 +103,11 @@ impl ConnectOptions for SqliteConnectOptions {
             }
         }
 
+        conn.install_layers(&self.layers);
+
         Ok(conn)
     }
 
-    fn log_statements(mut self, level: LevelFilter) -> Self {
-        self.log_settings.log_statements(level);
-        self
-    }
-
-    fn log_slow_statements(mut self, level: LevelFilter, duration: Duration) -> Self {
-        self.log_settings.log_slow_statements(level, duration);
-        self
-    }
-
-    fn __unstable_apply_driver_config(
-        self,
-        config: &config::drivers::Config,
-    ) -> crate::Result<Self> {
-        self.apply_driver_config(&config.sqlite)
-    }
-}
-
-impl SqliteConnectOptions {
     /// Collect all `PRAMGA` commands into a single string
     pub(crate) fn pragma_string(&self) -> String {
         let mut string = String::new();

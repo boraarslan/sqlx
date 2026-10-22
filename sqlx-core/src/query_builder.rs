@@ -464,6 +464,7 @@ where
             arguments: self.arguments.take().map(Ok),
             database: PhantomData,
             persistent: true,
+            extensions: Default::default(),
         }
     }
 

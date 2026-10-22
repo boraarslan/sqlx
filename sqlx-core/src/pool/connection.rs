@@ -9,6 +9,7 @@ use crate::sync::AsyncSemaphoreReleaser;
 use crate::connection::Connection;
 use crate::database::Database;
 use crate::error::Error;
+use crate::transaction::TransactionManager;
 
 use super::inner::{is_beyond_max_lifetime, DecrementSizeGuard, PoolInner};
 use crate::pool::options::PoolConnectionMetadata;
@@ -319,6 +320,13 @@ impl<DB: Database> Floating<DB, Live<DB>> {
 
             // Connection is broken, don't try to gracefully close.
             self.close_hard().await;
+            false
+        } else if DB::TransactionManager::get_transaction_depth(&self.raw) > 0 {
+            // Nothing will end this transaction, e.g. because middleware kept a `BEGIN` going
+            // after the `Transaction` which sent it was dropped. Closing the connection rolls it
+            // back; the next user of the connection would run their statements inside it.
+            tracing::warn!("closing a connection which was returned to the pool in a transaction");
+            self.close().await;
             false
         } else {
             // if the connection is still viable, release it to the pool

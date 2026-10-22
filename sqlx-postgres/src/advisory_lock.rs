@@ -4,7 +4,7 @@ use crate::PgConnection;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use sqlx_core::executor::Executor;
-use sqlx_core::sql_str::SqlSafeStr;
+use sqlx_core::sql_str::{AssertSqlSafe, SqlSafeStr};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -427,9 +427,9 @@ impl<C: AsMut<PgConnection>> Drop for PgAdvisoryLockGuard<C> {
             // Queue a simple query message to execute next time the connection is used.
             // The `async fn` versions can safely use the prepared statement protocol,
             // but this is the safest way to queue a query to execute on the next opportunity.
-            conn.as_mut()
-                .queue_simple_query(self.lock.get_release_query())
-                .expect("BUG: PgAdvisoryLock::get_release_query() somehow too long for protocol");
+            conn.as_mut().queue_simple_query(
+                AssertSqlSafe(self.lock.get_release_query().to_owned()).into_sql_str(),
+            );
         }
     }
 }

@@ -1,4 +1,5 @@
 use sqlx_core::database::Database;
+use sqlx_core::middleware::{Request, RequestKind};
 use sqlx_core::sql_str::SqlStr;
 
 use crate::error::Error;
@@ -15,94 +16,41 @@ impl TransactionManager for PgTransactionManager {
     type Database = Postgres;
 
     async fn begin(conn: &mut PgConnection, statement: Option<SqlStr>) -> Result<(), Error> {
-        let depth = conn.inner.transaction_depth;
-
-        let statement = match statement {
-            // custom `BEGIN` statements are not allowed if we're already in
-            // a transaction (we need to issue a `SAVEPOINT` instead)
-            Some(_) if depth > 0 => return Err(Error::InvalidSavePointStatement),
-            Some(statement) => statement,
-            None => begin_ansi_transaction_sql(depth),
-        };
-
-        let rollback = Rollback::new(conn);
-        rollback.conn.queue_simple_query(statement.as_str())?;
-        // Claim the depth before the round trip, not after. `start_rollback` -- which both
-        // this guard and `Transaction`'s own drop guard call -- is a no-op while the depth is
-        // zero, so a future cancelled during the await below would otherwise leave the server
-        // in a transaction with nothing queued to end it. `Pool` then hands that connection
-        // to the next borrower, whose statements silently run inside it. Unwound just below
-        // if the BEGIN did not take.
-        rollback.conn.inner.transaction_depth += 1;
-        rollback.conn.wait_until_ready().await?;
-        if !rollback.conn.in_transaction() {
-            rollback.conn.inner.transaction_depth -= 1;
-            return Err(Error::BeginFailed);
-        }
-        rollback.defuse();
-
-        Ok(())
+        let depth = conn.transaction_depth();
+        conn.dispatch(Request::begin(depth, statement)?).await?;
+        check_transaction_depth(RequestKind::Begin, depth, conn.transaction_depth())
     }
 
     async fn commit(conn: &mut PgConnection) -> Result<(), Error> {
-        if conn.inner.transaction_depth > 0 {
-            conn.execute(commit_ansi_transaction_sql(conn.inner.transaction_depth))
-                .await?;
+        let depth = conn.transaction_depth();
 
-            conn.inner.transaction_depth -= 1;
+        if depth > 0 {
+            conn.dispatch(Request::commit(depth)).await?;
+            check_transaction_depth(RequestKind::Commit, depth, conn.transaction_depth())?;
         }
 
         Ok(())
     }
 
     async fn rollback(conn: &mut PgConnection) -> Result<(), Error> {
-        if conn.inner.transaction_depth > 0 {
-            conn.execute(rollback_ansi_transaction_sql(conn.inner.transaction_depth))
-                .await?;
+        let depth = conn.transaction_depth();
 
-            conn.inner.transaction_depth -= 1;
+        if depth > 0 {
+            conn.dispatch(Request::rollback(depth)).await?;
+            check_transaction_depth(RequestKind::Rollback, depth, conn.transaction_depth())?;
         }
 
         Ok(())
     }
 
     fn start_rollback(conn: &mut PgConnection) {
-        if conn.inner.transaction_depth > 0 {
-            conn.queue_simple_query(
-                rollback_ansi_transaction_sql(conn.inner.transaction_depth).as_str(),
-            )
-            .expect("BUG: Rollback query somehow too large for protocol");
-
-            conn.inner.transaction_depth -= 1;
-        }
+        // The connection can only be locked by a response stream that middleware kept alive;
+        // in that case, the rollback is queued when the connection is next locked.
+        let mut locked = conn.try_lock();
+        conn.state.start_rollback(locked.as_deref_mut());
     }
 
     fn get_transaction_depth(conn: &<Self::Database as Database>::Connection) -> usize {
-        conn.inner.transaction_depth
-    }
-}
-
-struct Rollback<'c> {
-    conn: &'c mut PgConnection,
-    defuse: bool,
-}
-
-impl Drop for Rollback<'_> {
-    fn drop(&mut self) {
-        if !self.defuse {
-            PgTransactionManager::start_rollback(self.conn)
-        }
-    }
-}
-
-impl<'c> Rollback<'c> {
-    fn new(conn: &'c mut PgConnection) -> Self {
-        Self {
-            conn,
-            defuse: false,
-        }
-    }
-    fn defuse(mut self) {
-        self.defuse = true;
+        conn.transaction_depth()
     }
 }

@@ -117,6 +117,11 @@ The SQLite driver directly invokes the SQLite3 API via `libsqlite3-sys`, which r
 
 -   `Any` database driver for changing the database driver at runtime. An `AnyPool` connects to the driver indicated by the URL scheme.
 
+-   [Tower] middleware for every statement sent to the database, for pools, and for opening connections (`sqlx::middleware`),
+    including `tracing` spans that follow the OpenTelemetry semantic conventions for database clients.
+
+[Tower]: https://docs.rs/tower
+
 ## Install
 
 SQLx is compatible with the [`async-std`], [`tokio`], and [`actix`] runtimes; and, the [`native-tls`] and [`rustls`] TLS backends. When adding the dependency, you must choose a runtime feature that is `runtime` + `tls`.

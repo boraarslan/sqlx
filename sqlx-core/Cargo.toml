@@ -105,9 +105,16 @@ hashbrown = "0.16.0"
 
 thiserror.workspace = true
 
+# Middleware (Tower) support
+tower-layer.workspace = true
+tower-service.workspace = true
+sync_wrapper.workspace = true
+async-lock.workspace = true
+
 [dev-dependencies]
 tempfile = "3.10.1"
 tokio = { version = "1.25.0", features = ["rt"] }
+tower = { version = "0.5.3", features = ["timeout", "util"] }
 
 [dev-dependencies.sqlx]
 # FIXME: https://github.com/rust-lang/cargo/issues/15622

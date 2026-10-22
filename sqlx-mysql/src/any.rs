@@ -1,23 +1,20 @@
+use crate::connection::MySqlDriver;
 use crate::protocol::text::ColumnType;
 use crate::{
     MySql, MySqlColumn, MySqlConnectOptions, MySqlConnection, MySqlQueryResult, MySqlRow,
-    MySqlTransactionManager, MySqlTypeInfo,
+    MySqlStatement, MySqlTransactionManager, MySqlTypeInfo,
 };
-use either::Either;
 use futures_core::future::BoxFuture;
-use futures_core::stream::BoxStream;
-use futures_util::{stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures_util::FutureExt;
 use sqlx_core::any::{
-    AnyArguments, AnyColumn, AnyConnectOptions, AnyConnectionBackend, AnyQueryResult, AnyRow,
-    AnyStatement, AnyTypeInfo, AnyTypeInfoKind,
+    Any, AnyArguments, AnyColumn, AnyConnectOptions, AnyConnectionBackend, AnyQueryResult, AnyRow,
+    AnyServiceAdapter, AnyTypeInfo, AnyTypeInfoKind,
 };
 use sqlx_core::connection::Connection;
 use sqlx_core::database::Database;
-use sqlx_core::executor::Executor;
-use sqlx_core::sql_str::SqlStr;
+use sqlx_core::middleware::BoxService;
 use sqlx_core::transaction::TransactionManager;
 use sqlx_core::types::Type;
-use std::{future, pin::pin};
 
 sqlx_core::declare_driver_with_optional_migrate!(DRIVER = MySql);
 
@@ -38,16 +35,15 @@ impl AnyConnectionBackend for MySqlConnection {
         Connection::ping(self).boxed()
     }
 
-    fn begin(&mut self, statement: Option<SqlStr>) -> BoxFuture<'_, sqlx_core::Result<()>> {
-        MySqlTransactionManager::begin(self, statement).boxed()
-    }
-
-    fn commit(&mut self) -> BoxFuture<'_, sqlx_core::Result<()>> {
-        MySqlTransactionManager::commit(self).boxed()
-    }
-
-    fn rollback(&mut self) -> BoxFuture<'_, sqlx_core::Result<()>> {
-        MySqlTransactionManager::rollback(self).boxed()
+    fn service(&mut self) -> BoxService<Any> {
+        BoxService::new(AnyServiceAdapter::new(
+            MySqlDriver {
+                conn: self.conn.clone(),
+                state: self.state.clone(),
+            },
+            AnyArguments::convert_into,
+            |statement: &MySqlStatement| statement.metadata.column_names.clone(),
+        ))
     }
 
     fn start_rollback(&mut self) {
@@ -75,81 +71,6 @@ impl AnyConnectionBackend for MySqlConnection {
         &mut self,
     ) -> sqlx_core::Result<&mut (dyn sqlx_core::migrate::Migrate + Send + 'static)> {
         Ok(self)
-    }
-
-    fn fetch_many(
-        &mut self,
-        query: SqlStr,
-        persistent: bool,
-        arguments: Option<AnyArguments>,
-    ) -> BoxStream<'_, sqlx_core::Result<Either<AnyQueryResult, AnyRow>>> {
-        let persistent = persistent && arguments.is_some();
-        let arguments = match arguments.map(AnyArguments::convert_into).transpose() {
-            Ok(arguments) => arguments,
-            Err(error) => {
-                return stream::once(future::ready(Err(sqlx_core::Error::Encode(error)))).boxed()
-            }
-        };
-
-        Box::pin(
-            self.run(query, arguments, persistent)
-                .try_flatten_stream()
-                .map(|res| {
-                    Ok(match res? {
-                        Either::Left(result) => Either::Left(result.into()),
-                        Either::Right(row) => Either::Right(AnyRow::try_from(&row)?),
-                    })
-                }),
-        )
-    }
-
-    fn fetch_optional(
-        &mut self,
-        query: SqlStr,
-        persistent: bool,
-        arguments: Option<AnyArguments>,
-    ) -> BoxFuture<'_, sqlx_core::Result<Option<AnyRow>>> {
-        let persistent = persistent && arguments.is_some();
-        let arguments = arguments
-            .map(AnyArguments::convert_into)
-            .transpose()
-            .map_err(sqlx_core::Error::Encode);
-
-        Box::pin(async move {
-            let arguments = arguments?;
-            let mut stream = pin!(self.run(query, arguments, persistent).await?);
-
-            while let Some(result) = stream.try_next().await? {
-                if let Either::Right(row) = result {
-                    return Ok(Some(AnyRow::try_from(&row)?));
-                }
-            }
-
-            Ok(None)
-        })
-    }
-
-    fn prepare_with<'c, 'q: 'c>(
-        &'c mut self,
-        sql: SqlStr,
-        _parameters: &[AnyTypeInfo],
-    ) -> BoxFuture<'c, sqlx_core::Result<AnyStatement>> {
-        Box::pin(async move {
-            let statement = Executor::prepare_with(self, sql, &[]).await?;
-            let column_names = statement.metadata.column_names.clone();
-            AnyStatement::try_from_statement(statement, column_names)
-        })
-    }
-
-    #[cfg(feature = "offline")]
-    fn describe(
-        &mut self,
-        sql: SqlStr,
-    ) -> BoxFuture<'_, sqlx_core::Result<sqlx_core::describe::Describe<sqlx_core::any::Any>>> {
-        Box::pin(async move {
-            let describe = Executor::describe(self, sql).await?;
-            describe.try_into_any()
-        })
     }
 }
 

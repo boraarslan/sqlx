@@ -1,29 +1,54 @@
-use std::future::Future;
-
 use crate::any::{Any, AnyConnection};
 use crate::database::Database;
 use crate::error::Error;
+use crate::executor::Executor;
+use crate::middleware::{Request, RequestKind};
 use crate::sql_str::SqlStr;
-use crate::transaction::TransactionManager;
+use crate::transaction::{check_transaction_depth, TransactionManager};
 
 pub struct AnyTransactionManager;
 
 impl TransactionManager for AnyTransactionManager {
     type Database = Any;
 
-    fn begin(
-        conn: &mut AnyConnection,
-        statement: Option<SqlStr>,
-    ) -> impl Future<Output = Result<(), Error>> + Send + '_ {
-        conn.backend.begin(statement)
+    async fn begin(conn: &mut AnyConnection, statement: Option<SqlStr>) -> Result<(), Error> {
+        let depth = conn.backend.get_transaction_depth();
+        conn.dispatch(Request::begin(depth, statement)?).await?;
+        check_transaction_depth(
+            RequestKind::Begin,
+            depth,
+            conn.backend.get_transaction_depth(),
+        )
     }
 
-    fn commit(conn: &mut AnyConnection) -> impl Future<Output = Result<(), Error>> + Send + '_ {
-        conn.backend.commit()
+    async fn commit(conn: &mut AnyConnection) -> Result<(), Error> {
+        let depth = conn.backend.get_transaction_depth();
+
+        if depth > 0 {
+            conn.dispatch(Request::commit(depth)).await?;
+            check_transaction_depth(
+                RequestKind::Commit,
+                depth,
+                conn.backend.get_transaction_depth(),
+            )?;
+        }
+
+        Ok(())
     }
 
-    fn rollback(conn: &mut AnyConnection) -> impl Future<Output = Result<(), Error>> + Send + '_ {
-        conn.backend.rollback()
+    async fn rollback(conn: &mut AnyConnection) -> Result<(), Error> {
+        let depth = conn.backend.get_transaction_depth();
+
+        if depth > 0 {
+            conn.dispatch(Request::rollback(depth)).await?;
+            check_transaction_depth(
+                RequestKind::Rollback,
+                depth,
+                conn.backend.get_transaction_depth(),
+            )?;
+        }
+
+        Ok(())
     }
 
     fn start_rollback(conn: &mut AnyConnection) {

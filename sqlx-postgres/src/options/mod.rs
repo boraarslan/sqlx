@@ -7,7 +7,13 @@ use std::sync::{Arc, OnceLock};
 use sqlx_core::net::tls::TlsConnector;
 pub use ssl_mode::PgSslMode;
 
-use crate::{connection::LogSettings, net::tls::CertificateInput};
+use crate::{connection::LogSettings, net::tls::CertificateInput, PgConnection, Postgres};
+use sqlx_core::connection::ConnectOptions;
+use sqlx_core::error::BoxDynError;
+use sqlx_core::middleware::{
+    BoxConnectService, BoxService, ConnectLayers, ConnectRequest, Layer, Layers, Request, Response,
+    Service,
+};
 
 mod connect;
 mod parse;
@@ -29,6 +35,8 @@ pub struct PgConnectOptions {
     pub(crate) log_settings: LogSettings,
     pub(crate) extra_float_digits: Option<Cow<'static, str>>,
     pub(crate) options: Option<String>,
+    pub(crate) layers: Layers<BoxService<Postgres>>,
+    pub(crate) connect_layers: ConnectLayers<Postgres>,
 }
 
 impl Default for PgConnectOptions {
@@ -108,6 +116,8 @@ impl PgConnectOptions {
             extra_float_digits: Some("2".into()),
             log_settings: Default::default(),
             options: var("PGOPTIONS").ok(),
+            layers: Layers::new(),
+            connect_layers: ConnectLayers::new(),
         }
     }
 
@@ -491,6 +501,38 @@ impl PgConnectOptions {
 }
 
 impl PgConnectOptions {
+    /// Add a [Tower] middleware [`Layer`] to every connection made with these options.
+    ///
+    /// See [`ConnectOptions::layer()`][sqlx_core::connection::ConnectOptions::layer]
+    /// and the [`middleware`][sqlx_core::middleware] module for details.
+    ///
+    /// [Tower]: https://docs.rs/tower
+    pub fn layer<L>(self, layer: L) -> Self
+    where
+        L: Layer<BoxService<Postgres>> + Send + Sync + 'static,
+        L::Service: Service<Request<Postgres>, Response = Response<Postgres>> + Send + 'static,
+        <L::Service as Service<Request<Postgres>>>::Error: Into<BoxDynError> + 'static,
+        <L::Service as Service<Request<Postgres>>>::Future: Send + 'static,
+    {
+        ConnectOptions::layer(self, layer)
+    }
+
+    /// Add a [Tower] middleware [`Layer`] around opening connections with these options.
+    ///
+    /// See [`ConnectOptions::connect_layer()`][sqlx_core::connection::ConnectOptions::connect_layer]
+    /// and the [`middleware`][sqlx_core::middleware] module for details.
+    ///
+    /// [Tower]: https://docs.rs/tower
+    pub fn connect_layer<L>(self, layer: L) -> Self
+    where
+        L: Layer<BoxConnectService<Postgres>> + Send + Sync + 'static,
+        L::Service: Service<ConnectRequest<Postgres>, Response = PgConnection> + Send + 'static,
+        <L::Service as Service<ConnectRequest<Postgres>>>::Error: Into<BoxDynError> + 'static,
+        <L::Service as Service<ConnectRequest<Postgres>>>::Future: Send + 'static,
+    {
+        ConnectOptions::connect_layer(self, layer)
+    }
+
     /// Get the current host.
     ///
     /// # Example

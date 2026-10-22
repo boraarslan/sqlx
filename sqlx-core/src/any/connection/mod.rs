@@ -1,5 +1,6 @@
 use futures_core::future::BoxFuture;
 use std::future::Future;
+use std::sync::Arc;
 
 use crate::any::{Any, AnyConnectOptions};
 use crate::connection::{ConnectOptions, Connection};
@@ -7,10 +8,15 @@ use crate::error::Error;
 
 use crate::config;
 use crate::database::Database;
+use crate::middleware::{BoxService, ConnectionService, Request, Response, Service};
 use crate::sql_str::SqlSafeStr;
 use crate::transaction::Transaction;
+#[doc(hidden)]
+pub use adapter::AnyServiceAdapter;
 pub use backend::AnyConnectionBackend;
+use std::task::{Context, Poll};
 
+mod adapter;
 mod backend;
 mod executor;
 
@@ -26,6 +32,7 @@ mod executor;
 #[derive(Debug)]
 pub struct AnyConnection {
     pub(crate) backend: Box<dyn AnyConnectionBackend>,
+    pub(crate) service: ConnectionService<Any, BoxService<Any>>,
 }
 
 impl AnyConnection {
@@ -69,6 +76,8 @@ impl AnyConnection {
             for<'b> TryFrom<&'b AnyConnectOptions, Error = Error>,
     {
         let res = TryFrom::try_from(options);
+        let layers = options.layers.clone();
+        let info = Arc::new(options.connection_info());
 
         Box::pin(async move {
             let mut options: <DB::Connection as Connection>::Options = res?;
@@ -77,9 +86,10 @@ impl AnyConnection {
                 options = options.__unstable_apply_driver_config(config)?;
             }
 
-            Ok(AnyConnection {
-                backend: Box::new(options.connect().await?),
-            })
+            let mut backend: Box<dyn AnyConnectionBackend> = Box::new(options.connect().await?);
+            let service = ConnectionService::new(backend.service(), &layers, info);
+
+            Ok(AnyConnection { backend, service })
         })
     }
 
@@ -147,5 +157,29 @@ impl Connection for AnyConnection {
     #[doc(hidden)]
     fn should_flush(&self) -> bool {
         self.backend.should_flush()
+    }
+}
+
+/// Sends requests through the middleware stack of this connection.
+///
+/// The stream of a response keeps the connection busy until it's exhausted or dropped, even
+/// though it doesn't borrow the connection: drop it before sending another request on the same
+/// task, or that request waits forever.
+///
+/// See the [`middleware`][crate::middleware] module for details.
+impl Service<Request<Any>> for AnyConnection {
+    type Response = Response<Any>;
+    type Error = Error;
+    type Future = BoxFuture<'static, Result<Response<Any>, Error>>;
+
+    #[inline]
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.service.poll_ready(cx)
+    }
+
+    #[inline]
+    fn call(&mut self, request: Request<Any>) -> Self::Future {
+        let depth = self.backend.get_transaction_depth();
+        self.service.call(request, depth)
     }
 }

@@ -26,6 +26,7 @@ uuid = ["dep:uuid", "sqlx-core/uuid"]
 
 [dependencies]
 sqlx-core = { workspace = true }
+async-lock.workspace = true
 
 # Futures crates
 futures-core = { version = "0.3.32", default-features = false }

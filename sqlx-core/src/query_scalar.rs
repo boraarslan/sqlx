@@ -43,6 +43,11 @@ where
     fn persistent(&self) -> bool {
         Execute::persistent(&self.inner)
     }
+
+    #[inline]
+    fn take_extensions(&mut self) -> crate::middleware::Extensions {
+        self.inner.take_extensions()
+    }
 }
 
 impl<'q, DB: Database, O> QueryScalar<'q, DB, O, <DB as Database>::Arguments> {
@@ -71,6 +76,17 @@ where
     /// Default: `true`.
     pub fn persistent(mut self, value: bool) -> Self {
         self.inner = self.inner.persistent(value);
+        self
+    }
+}
+
+impl<DB: Database, O, A> QueryScalar<'_, DB, O, A> {
+    /// Attach a value to the [`Request`][crate::middleware::Request] made for this query,
+    /// for use by middleware.
+    ///
+    /// See [`Query::extension()`][crate::query::Query::extension].
+    pub fn extension<T: Clone + Send + Sync + 'static>(mut self, value: T) -> Self {
+        self.inner = self.inner.extension(value);
         self
     }
 }

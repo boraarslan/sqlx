@@ -1,8 +1,6 @@
-use crate::any::{AnyArguments, AnyQueryResult, AnyRow, AnyStatement, AnyTypeInfo};
-use crate::sql_str::SqlStr;
-use either::Either;
+use crate::any::Any;
+use crate::middleware::BoxService;
 use futures_core::future::BoxFuture;
-use futures_core::stream::BoxStream;
 use std::fmt::Debug;
 
 pub trait AnyConnectionBackend: std::any::Any + Debug + Send + 'static {
@@ -25,19 +23,26 @@ pub trait AnyConnectionBackend: std::any::Any + Debug + Send + 'static {
     /// Checks if a connection to the database is still valid.
     fn ping(&mut self) -> BoxFuture<'_, crate::Result<()>>;
 
-    /// Begin a new transaction or establish a savepoint within the active transaction.
+    /// Create the service which executes [`Request`][crate::middleware::Request]s
+    /// on this connection, converting between the `Any` types and those of the backend.
     ///
-    /// If this is a new transaction, `statement` may be used instead of the
-    /// default "BEGIN" statement.
+    /// This is called once, when the [`AnyConnection`][crate::any::AnyConnection] is created.
+    /// The service must be `'static`; it typically shares the state of the connection with
+    /// the backend through an `Arc`.
     ///
-    /// If we are already inside a transaction and `statement.is_some()`, then
-    /// `Error::InvalidSavePoint` is returned without running any statements.
-    fn begin(&mut self, statement: Option<SqlStr>) -> BoxFuture<'_, crate::Result<()>>;
+    /// It must handle every [`RequestKind`][crate::middleware::RequestKind], including
+    /// transaction control requests, for which it must maintain the transaction depth
+    /// returned by [`get_transaction_depth()`][Self::get_transaction_depth].
+    ///
+    /// The service should be ready immediately whenever the connection is not in use,
+    /// as requests then avoid an extra allocation.
+    fn service(&mut self) -> BoxService<Any>;
 
-    fn commit(&mut self) -> BoxFuture<'_, crate::Result<()>>;
-
-    fn rollback(&mut self) -> BoxFuture<'_, crate::Result<()>>;
-
+    /// Queue a `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`) for the current transaction depth
+    /// without waiting for it, and decrement the depth.
+    ///
+    /// Called when a [`Transaction`][crate::transaction::Transaction] is dropped without
+    /// being committed or rolled back.
     fn start_rollback(&mut self);
 
     /// Returns the current transaction depth.
@@ -46,9 +51,7 @@ pub trait AnyConnectionBackend: std::any::Any + Debug + Send + 'static {
     /// - Level 0: No active transaction.
     /// - Level 1: A transaction is active.
     /// - Level 2 or higher: A transaction is active and one or more SAVEPOINTs have been created within it.
-    fn get_transaction_depth(&self) -> usize {
-        unimplemented!("get_transaction_depth() is not implemented for this backend. This is a provided method to avoid a breaking change, but it will become a required method in version 0.9 and later.");
-    }
+    fn get_transaction_depth(&self) -> usize;
 
     /// Checks if the connection is currently in a transaction.
     ///
@@ -92,30 +95,4 @@ pub trait AnyConnectionBackend: std::any::Any + Debug + Send + 'static {
             .into(),
         ))
     }
-
-    fn fetch_many(
-        &mut self,
-        query: SqlStr,
-        persistent: bool,
-        arguments: Option<AnyArguments>,
-    ) -> BoxStream<'_, crate::Result<Either<AnyQueryResult, AnyRow>>>;
-
-    fn fetch_optional(
-        &mut self,
-        query: SqlStr,
-        persistent: bool,
-        arguments: Option<AnyArguments>,
-    ) -> BoxFuture<'_, crate::Result<Option<AnyRow>>>;
-
-    fn prepare_with<'c, 'q: 'c>(
-        &'c mut self,
-        sql: SqlStr,
-        parameters: &[AnyTypeInfo],
-    ) -> BoxFuture<'c, crate::Result<AnyStatement>>;
-
-    #[cfg(feature = "offline")]
-    fn describe(
-        &mut self,
-        sql: SqlStr,
-    ) -> BoxFuture<'_, crate::Result<crate::describe::Describe<crate::any::Any>>>;
 }

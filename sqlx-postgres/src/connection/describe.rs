@@ -1,3 +1,4 @@
+use crate::connection::PgConn;
 use crate::error::Error;
 use crate::executor::Executor;
 use crate::io::StatementId;
@@ -10,15 +11,6 @@ use sqlx_core::query_builder::QueryBuilder;
 use sqlx_core::sql_str::AssertSqlSafe;
 
 impl PgConnection {
-    /// Check whether EXPLAIN statements are supported by the current connection
-    fn is_explain_available(&self) -> bool {
-        let parameter_statuses = &self.inner.stream.parameter_statuses;
-        let is_cockroachdb = parameter_statuses.contains_key("crdb_version");
-        let is_materialize = parameter_statuses.contains_key("mz_version");
-        let is_questdb = parameter_statuses.contains_key("questdb_version");
-        !is_cockroachdb && !is_materialize && !is_questdb
-    }
-
     /// Prepare a freshly-opened connection that the query macros use for `describe`.
     ///
     /// Forces a generic query plan so that nullability inference via `EXPLAIN` reflects
@@ -34,12 +26,25 @@ impl PgConnection {
     /// (`SQLSTATE 0A000`). See <https://github.com/launchbadge/sqlx/issues/4274>.
     #[doc(hidden)]
     pub async fn force_generic_plan_for_describe(&mut self) -> Result<(), Error> {
-        if self.is_explain_available() && self.server_version_num().is_some_and(|v| v >= 120_000) {
+        let explain_available = self.lock().await.is_explain_available();
+
+        if explain_available && self.server_version_num().is_some_and(|v| v >= 120_000) {
             self.execute("SET plan_cache_mode = 'force_generic_plan'")
                 .await?;
         }
 
         Ok(())
+    }
+}
+
+impl PgConn {
+    /// Check whether EXPLAIN statements are supported by the current connection
+    fn is_explain_available(&self) -> bool {
+        let parameter_statuses = &self.inner.stream.parameter_statuses;
+        let is_cockroachdb = parameter_statuses.contains_key("crdb_version");
+        let is_materialize = parameter_statuses.contains_key("mz_version");
+        let is_questdb = parameter_statuses.contains_key("questdb_version");
+        !is_cockroachdb && !is_materialize && !is_questdb
     }
 
     pub(crate) async fn get_nullable_for_columns(

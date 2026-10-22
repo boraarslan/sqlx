@@ -1,6 +1,7 @@
 use crate::connection::Connection;
 use crate::database::Database;
-use crate::error::Error;
+use crate::error::{BoxDynError, Error};
+use crate::middleware::{BoxService, Layer, Layers, Request, Response, Service};
 use crate::pool::inner::PoolInner;
 use crate::pool::Pool;
 use futures_core::future::BoxFuture;
@@ -85,6 +86,8 @@ pub struct PoolOptions<DB: Database> {
     pub(crate) fair: bool,
 
     pub(crate) parent_pool: Option<Pool<DB>>,
+
+    pub(crate) layers: Layers<BoxService<DB>>,
 }
 
 // Manually implement `Clone` to avoid a trait bound issue.
@@ -107,6 +110,7 @@ impl<DB: Database> Clone for PoolOptions<DB> {
             idle_timeout: self.idle_timeout,
             fair: self.fair,
             parent_pool: self.parent_pool.clone(),
+            layers: self.layers.clone(),
         }
     }
 }
@@ -162,6 +166,7 @@ impl<DB: Database> PoolOptions<DB> {
             max_lifetime: Some(Duration::from_secs(30 * 60)),
             fair: true,
             parent_pool: None,
+            layers: Layers::new(),
         }
     }
 
@@ -500,6 +505,40 @@ impl<DB: Database> PoolOptions<DB> {
         self
     }
 
+    /// Add a [Tower] middleware [`Layer`] for queries executed directly on the pool.
+    ///
+    /// The layer sees every [`Request`] made through the [`Executor`] implementation of `&Pool`
+    /// (e.g. `query.fetch_all(&pool)`) *before* a connection is acquired, so the time waiting for
+    /// a connection is included in the request.
+    ///
+    /// It does not see requests made on connections acquired with [`Pool::acquire()`] or
+    /// transactions started with [`Pool::begin()`]; to see every statement executed on every
+    /// connection, add a layer to the connect options instead with
+    /// [`ConnectOptions::layer()`][crate::connection::ConnectOptions::layer].
+    ///
+    /// The stack is shared by all users of the pool: there is one instance of each middleware
+    /// service, used by all requests through the pool. The instance is locked for the
+    /// (short) time between a request's call to `poll_ready()` and `call()`;
+    /// see [`BoxService`] for details.
+    ///
+    /// Layers are applied like `tower::ServiceBuilder`: the first layer added is the outermost
+    /// and sees each request first.
+    ///
+    /// See the [`middleware`][crate::middleware] module for details.
+    ///
+    /// [Tower]: https://docs.rs/tower
+    /// [`Executor`]: crate::executor::Executor
+    pub fn layer<L>(mut self, layer: L) -> Self
+    where
+        L: Layer<BoxService<DB>> + Send + Sync + 'static,
+        L::Service: Service<Request<DB>, Response = Response<DB>> + Send + 'static,
+        <L::Service as Service<Request<DB>>>::Error: Into<BoxDynError> + 'static,
+        <L::Service as Service<Request<DB>>>::Future: Send + 'static,
+    {
+        self.layers.push(layer);
+        self
+    }
+
     /// Set the parent `Pool` from which the new pool will inherit its semaphore.
     ///
     /// This is currently an internal-only API.
@@ -591,6 +630,7 @@ impl<DB: Database> Debug for PoolOptions<DB> {
             .field("max_lifetime", &self.max_lifetime)
             .field("idle_timeout", &self.idle_timeout)
             .field("test_before_acquire", &self.test_before_acquire)
+            .field("layers", &self.layers.len())
             .finish()
     }
 }

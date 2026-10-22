@@ -3,20 +3,20 @@ use std::str::from_utf8;
 
 use futures_channel::mpsc;
 use futures_core::future::BoxFuture;
-use futures_core::stream::{BoxStream, Stream};
-use futures_util::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures_core::stream::Stream;
+use futures_util::{FutureExt, TryFutureExt};
 use sqlx_core::acquire::Acquire;
-use sqlx_core::sql_str::{AssertSqlSafe, SqlStr};
+use sqlx_core::sql_str::AssertSqlSafe;
 use sqlx_core::transaction::Transaction;
-use sqlx_core::Either;
 use tracing::Instrument;
 
 use crate::error::Error;
-use crate::executor::{Execute, Executor};
+use crate::executor::Executor;
 use crate::message::{BackendMessageFormat, Notification};
 use crate::pool::PoolOptions;
 use crate::pool::{Pool, PoolConnection};
-use crate::{PgConnection, PgQueryResult, PgRow, PgStatement, PgTypeInfo, Postgres};
+use crate::{PgConnection, Postgres};
+use sqlx_core::middleware::{Request, Response};
 
 /// A stream of asynchronous notifications from Postgres.
 ///
@@ -58,11 +58,11 @@ impl PgListener {
 
     pub async fn connect_with(pool: &Pool<Postgres>) -> Result<Self, Error> {
         // Pull out an initial connection
-        let mut connection = pool.acquire().await?;
+        let connection = pool.acquire().await?;
 
         // Setup a notification buffer
         let (sender, receiver) = mpsc::unbounded();
-        connection.inner.stream.notifications = Some(sender);
+        connection.lock().await.inner.stream.notifications = Some(sender);
 
         Ok(Self {
             pool: pool.clone(),
@@ -176,7 +176,7 @@ impl PgListener {
     async fn connect_if_needed(&mut self) -> Result<(), Error> {
         if self.connection.is_none() {
             let mut connection = self.pool.acquire().await?;
-            connection.inner.stream.notifications = self.buffer_tx.take();
+            connection.lock().await.inner.stream.notifications = self.buffer_tx.take();
 
             connection
                 .execute(AssertSqlSafe(build_listen_all_query(&self.channels)))
@@ -264,7 +264,7 @@ impl PgListener {
             // update self state
             Err(Error::Io(_)) => {
                 if let Some(mut conn) = self.connection.take() {
-                    self.buffer_tx = conn.inner.stream.notifications.take();
+                    self.buffer_tx = conn.lock().await.inner.stream.notifications.take();
                     // Close the connection in a background task, so we can continue.
                     conn.close_on_drop();
                 }
@@ -301,7 +301,8 @@ impl PgListener {
         let mut close_event = (!self.ignore_close_event).then(|| self.pool.close_event());
 
         loop {
-            let next_message = self.connection().await?.inner.stream.recv_unchecked();
+            let mut conn = self.connection().await?.lock().await;
+            let next_message = conn.inner.stream.recv_unchecked();
 
             let res = if let Some(ref mut close_event) = close_event {
                 // cancels the wait and returns `Err(PoolClosed)` if the pool is closed
@@ -321,7 +322,7 @@ impl PgListener {
 
                 // Mark the connection as ready for another query
                 BackendMessageFormat::ReadyForQuery => {
-                    self.connection().await?.inner.pending_ready_for_query_count -= 1;
+                    conn.inner.pending_ready_for_query_count -= 1;
                 }
 
                 // Ignore unexpected messages
@@ -392,62 +393,14 @@ impl<'c> Acquire<'c> for &'c mut PgListener {
 impl<'c> Executor<'c> for &'c mut PgListener {
     type Database = Postgres;
 
-    fn fetch_many<'e, 'q, E>(
+    fn dispatch<'e>(
         self,
-        query: E,
-    ) -> BoxStream<'e, Result<Either<PgQueryResult, PgRow>, Error>>
-    where
-        'c: 'e,
-        E: Execute<'q, Self::Database>,
-        'q: 'e,
-        E: 'q,
-    {
-        futures_util::stream::once(async move {
-            // need some basic type annotation to help the compiler a bit
-            let res: Result<_, Error> = Ok(self.connection().await?.fetch_many(query));
-            res
-        })
-        .try_flatten()
-        .boxed()
-    }
-
-    fn fetch_optional<'e, 'q, E>(self, query: E) -> BoxFuture<'e, Result<Option<PgRow>, Error>>
-    where
-        'c: 'e,
-        E: Execute<'q, Self::Database>,
-        'q: 'e,
-        E: 'q,
-    {
-        async move { self.connection().await?.fetch_optional(query).await }.boxed()
-    }
-
-    fn prepare_with<'e>(
-        self,
-        query: SqlStr,
-        parameters: &'e [PgTypeInfo],
-    ) -> BoxFuture<'e, Result<PgStatement, Error>>
+        request: Request<Postgres>,
+    ) -> BoxFuture<'e, Result<Response<Postgres>, Error>>
     where
         'c: 'e,
     {
-        async move {
-            self.connection()
-                .await?
-                .prepare_with(query, parameters)
-                .await
-        }
-        .boxed()
-    }
-
-    #[doc(hidden)]
-    #[cfg(feature = "offline")]
-    fn describe<'e>(
-        self,
-        query: SqlStr,
-    ) -> BoxFuture<'e, Result<crate::describe::Describe<Self::Database>, Error>>
-    where
-        'c: 'e,
-    {
-        async move { self.connection().await?.describe(query).await }.boxed()
+        async move { self.connection().await?.dispatch(request).await }.boxed()
     }
 }
 
