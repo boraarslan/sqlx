@@ -1,11 +1,12 @@
+use std::future;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use async_lock::Mutex;
+use async_lock::{Mutex, MutexGuardArc};
 use futures_core::future::BoxFuture;
 use futures_util::TryStreamExt;
-use sqlx_core::middleware::{Request, RequestKind, Response, ResultStream, Service};
+use sqlx_core::middleware::{Request, RequestKind, RequestParts, Response, ResultStream, Service};
 use sqlx_core::sql_str::SqlStr;
 
 use crate::connection::{lock, MySqlConn, MySqlConnectionState};
@@ -36,82 +37,99 @@ impl Service<Request<MySql>> for MySqlDriver {
     }
 
     fn call(&mut self, request: Request<MySql>) -> Self::Future {
-        let conn = lock(self.conn.clone(), self.state.clone());
+        // Lock the connection right away if it's not in use, which avoids an allocation.
+        let locked = match self.conn.try_lock_arc() {
+            Some(mut conn) => {
+                self.state.queue_pending_queries(&mut conn);
+                Ok(conn)
+            }
+            None => Err(self.conn.clone()),
+        };
         let state = self.state.clone();
 
-        Box::pin(async move {
-            let mut conn = conn.await;
-            let request = request.into_parts();
+        let RequestParts {
+            kind,
+            sql,
+            arguments,
+            persistent,
+            ..
+        } = request.into_parts();
 
-            match request.kind {
-                RequestKind::Fetch | RequestKind::FetchOptional => {
-                    // Stop reading after the first row; the rest of the response is discarded
-                    // before the next request.
-                    let optional = request.kind == RequestKind::FetchOptional;
+        // Each kind of request has its own future, so that the common ones stay small.
+        match kind {
+            RequestKind::Fetch | RequestKind::FetchOptional => Box::pin(async move {
+                let conn = acquire(locked, &state).await;
 
-                    let stream = try_stream! {
-                        let mut stream = pin!(
-                            conn.run(request.sql, request.arguments, request.persistent).await?
-                        );
+                // Stop reading after the first row; the rest of the response is discarded
+                // before the next request.
+                let first_row_only = kind == RequestKind::FetchOptional;
 
-                        while let Some(item) = stream.try_next().await? {
-                            let is_row = item.is_right();
+                // The stream owns the lock guard.
+                let stream =
+                    MySqlConn::run(conn, sql, arguments, persistent, first_row_only).await?;
 
-                            r#yield!(item);
-
-                            if optional && is_row {
-                                break;
-                            }
-                        }
-
-                        Ok(())
-                    };
-
-                    ResultStream::new(stream)
-                        .prefetch()
-                        .await
-                        .map(Response::Stream)
-                }
-                RequestKind::Prepare => conn
-                    .prepare_with_cache(request.sql)
+                ResultStream::new(stream)
+                    .prefetch()
                     .await
-                    .map(Response::Statement),
-                #[cfg(feature = "offline")]
-                RequestKind::Describe => conn.describe(request.sql).await.map(Response::Describe),
-                RequestKind::Begin => {
-                    let depth = state.transaction_depth();
+                    .map(Response::Stream)
+            }),
+            RequestKind::Prepare => Box::pin(async move {
+                let mut conn = acquire(locked, &state).await;
 
-                    execute(&mut conn, request.sql).await?;
+                conn.prepare_with_cache(sql).await.map(Response::Statement)
+            }),
+            #[cfg(feature = "offline")]
+            RequestKind::Describe => Box::pin(async move {
+                let mut conn = acquire(locked, &state).await;
 
-                    if !conn.in_transaction() {
-                        return Err(Error::BeginFailed);
-                    }
+                conn.describe(sql).await.map(Response::Describe)
+            }),
+            RequestKind::Begin => Box::pin(async move {
+                let mut conn = acquire(locked, &state).await;
+                let depth = state.transaction_depth();
 
-                    state.set_transaction_depth(depth + 1);
+                execute(&mut conn, sql).await?;
 
-                    Ok(Response::Done)
+                if !conn.in_transaction() {
+                    return Err(Error::BeginFailed);
                 }
-                RequestKind::Commit | RequestKind::Rollback => {
-                    let depth = state.transaction_depth();
 
-                    if depth > 0 {
-                        execute(&mut conn, request.sql).await?;
-                        state.set_transaction_depth(depth - 1);
-                    }
+                state.set_transaction_depth(depth + 1);
 
-                    Ok(Response::Done)
+                Ok(Response::Done)
+            }),
+            RequestKind::Commit | RequestKind::Rollback => Box::pin(async move {
+                let mut conn = acquire(locked, &state).await;
+                let depth = state.transaction_depth();
+
+                if depth > 0 {
+                    execute(&mut conn, sql).await?;
+                    state.set_transaction_depth(depth - 1);
                 }
-                kind => Err(Error::InvalidArgument(format!(
-                    "unsupported request kind for MySQL: {kind:?}"
-                ))),
-            }
-        })
+
+                Ok(Response::Done)
+            }),
+            kind => Box::pin(future::ready(Err(Error::InvalidArgument(format!(
+                "unsupported request kind for MySQL: {kind:?}"
+            ))))),
+        }
+    }
+}
+
+/// Wait for the lock on the connection if `call()` could not take it right away.
+async fn acquire(
+    locked: Result<MutexGuardArc<MySqlConn>, Arc<Mutex<MySqlConn>>>,
+    state: &Arc<MySqlConnectionState>,
+) -> MutexGuardArc<MySqlConn> {
+    match locked {
+        Ok(conn) => conn,
+        Err(conn) => lock(conn, state.clone()).await,
     }
 }
 
 /// Execute a statement using the text protocol and wait for it to complete.
 async fn execute(conn: &mut MySqlConn, statement: SqlStr) -> Result<(), Error> {
-    let mut stream = pin!(conn.run(statement, None, false).await?);
+    let mut stream = pin!(MySqlConn::run(&mut *conn, statement, None, false, false).await?);
     while stream.try_next().await?.is_some() {}
 
     Ok(())

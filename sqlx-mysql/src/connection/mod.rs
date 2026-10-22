@@ -11,12 +11,12 @@ pub(crate) use sqlx_core::connection::*;
 use sqlx_core::middleware::{
     BoxService, ConnectionInfo, ConnectionService, Layers, Request, Response, Service,
 };
-use sqlx_core::sql_str::{SqlSafeStr, SqlStr};
+use sqlx_core::sql_str::SqlSafeStr;
 use sqlx_core::transaction::rollback_ansi_transaction_sql;
 pub(crate) use stream::{MySqlStream, Waiting};
 
 use crate::collation::Collation;
-use crate::common::StatementCache;
+use crate::common::{PendingQueries, StatementCache};
 use crate::error::Error;
 use crate::protocol::response::Status;
 use crate::protocol::statement::StmtClose;
@@ -64,7 +64,7 @@ pub(crate) struct MySqlConnectionState {
     /// which happens if middleware keeps a response stream alive after its request completed.
     ///
     /// These are queued on the connection the next time it is locked.
-    pending_rollbacks: std::sync::Mutex<Vec<SqlStr>>,
+    pending_rollbacks: PendingQueries,
 }
 
 /// The protocol state of a [`MySqlConnection`]: the stream to the server and its caches.
@@ -131,7 +131,7 @@ impl MySqlConnection {
     /// Lock the protocol state of the connection if it's not in use.
     pub(crate) fn try_lock(&self) -> Option<MutexGuardArc<MySqlConn>> {
         let mut conn = self.conn.try_lock_arc()?;
-        self.state.queue_pending_rollbacks(&mut conn);
+        self.state.queue_pending_queries(&mut conn);
         Some(conn)
     }
 
@@ -146,7 +146,7 @@ pub(crate) async fn lock(
     state: Arc<MySqlConnectionState>,
 ) -> MutexGuardArc<MySqlConn> {
     let mut conn = conn.lock_arc().await;
-    state.queue_pending_rollbacks(&mut conn);
+    state.queue_pending_queries(&mut conn);
     conn
 }
 
@@ -174,23 +174,14 @@ impl MySqlConnectionState {
 
         match conn {
             Some(conn) => conn.queue_simple_query(statement.as_str()),
-            None => self
-                .pending_rollbacks
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(statement),
+            None => self.pending_rollbacks.push(statement),
         }
 
         self.set_transaction_depth(depth - 1);
     }
 
-    fn queue_pending_rollbacks(&self, conn: &mut MySqlConn) {
-        let mut pending = self
-            .pending_rollbacks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        for statement in pending.drain(..) {
+    pub(crate) fn queue_pending_queries(&self, conn: &mut MySqlConn) {
+        for statement in self.pending_rollbacks.take() {
             conn.queue_simple_query(statement.as_str());
         }
     }

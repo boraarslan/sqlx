@@ -1,3 +1,4 @@
+use std::future;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -5,7 +6,7 @@ use std::task::{Context, Poll};
 use async_lock::{Mutex, MutexGuardArc};
 use futures_core::future::BoxFuture;
 use futures_util::TryStreamExt;
-use sqlx_core::middleware::{Request, RequestKind, Response, ResultStream, Service};
+use sqlx_core::middleware::{Request, RequestKind, RequestParts, Response, ResultStream, Service};
 use sqlx_core::sql_str::SqlStr;
 
 use crate::connection::{lock, PgConn, PgConnectionState};
@@ -35,54 +36,80 @@ impl Service<Request<Postgres>> for PgDriver {
     }
 
     fn call(&mut self, request: Request<Postgres>) -> Self::Future {
-        let conn = lock(self.conn.clone(), self.state.clone());
+        // Lock the connection right away if it's not in use, which avoids an allocation.
+        let locked = match self.conn.try_lock_arc() {
+            Some(mut conn) => {
+                self.state.queue_pending_queries(&mut conn);
+                Ok(conn)
+            }
+            None => Err(self.conn.clone()),
+        };
         let state = self.state.clone();
 
-        Box::pin(async move {
-            let mut conn = conn.await;
-            let request = request.into_parts();
+        let RequestParts {
+            kind,
+            sql,
+            arguments,
+            persistent,
+            statement,
+            parameter_types,
+            ..
+        } = request.into_parts();
 
-            match request.kind {
-                RequestKind::Fetch | RequestKind::FetchOptional => {
-                    let metadata = request.statement.map(|statement| statement.metadata);
+        // Each kind of request has its own future, so that the common ones stay small.
+        match kind {
+            RequestKind::Fetch | RequestKind::FetchOptional => Box::pin(async move {
+                let conn = acquire(locked, &state).await;
+                let metadata = statement.map(|statement| statement.metadata);
 
-                    let stream = try_stream! {
-                        let mut stream = pin!(
-                            conn.run(request.sql, request.arguments, request.persistent, metadata)
-                                .await?
-                        );
+                // The stream owns the lock guard.
+                let stream = PgConn::run(conn, sql, arguments, persistent, metadata).await?;
 
-                        while let Some(item) = stream.try_next().await? {
-                            r#yield!(item);
-                        }
-
-                        Ok(())
-                    };
-
-                    ResultStream::new(stream)
-                        .prefetch()
-                        .await
-                        .map(Response::Stream)
-                }
-                RequestKind::Prepare => conn
-                    .prepare_statement(request.sql, &request.parameter_types)
+                ResultStream::new(stream)
+                    .prefetch()
                     .await
-                    .map(Response::Statement),
-                #[cfg(feature = "offline")]
-                RequestKind::Describe => conn.describe(request.sql).await.map(Response::Describe),
-                RequestKind::Begin => {
-                    begin(&mut conn, &state, request.sql).await?;
-                    Ok(Response::Done)
-                }
-                RequestKind::Commit | RequestKind::Rollback => {
-                    end_transaction(&mut conn, &state, request.sql).await?;
-                    Ok(Response::Done)
-                }
-                kind => Err(Error::InvalidArgument(format!(
-                    "unsupported request kind for Postgres: {kind:?}"
-                ))),
-            }
-        })
+                    .map(Response::Stream)
+            }),
+            RequestKind::Prepare => Box::pin(async move {
+                let mut conn = acquire(locked, &state).await;
+
+                conn.prepare_statement(sql, &parameter_types)
+                    .await
+                    .map(Response::Statement)
+            }),
+            #[cfg(feature = "offline")]
+            RequestKind::Describe => Box::pin(async move {
+                let mut conn = acquire(locked, &state).await;
+
+                conn.describe(sql).await.map(Response::Describe)
+            }),
+            RequestKind::Begin => Box::pin(async move {
+                let mut conn = acquire(locked, &state).await;
+                begin(&mut conn, &state, sql).await?;
+
+                Ok(Response::Done)
+            }),
+            RequestKind::Commit | RequestKind::Rollback => Box::pin(async move {
+                let mut conn = acquire(locked, &state).await;
+                end_transaction(&mut conn, &state, sql).await?;
+
+                Ok(Response::Done)
+            }),
+            kind => Box::pin(future::ready(Err(Error::InvalidArgument(format!(
+                "unsupported request kind for Postgres: {kind:?}"
+            ))))),
+        }
+    }
+}
+
+/// Wait for the lock on the connection if `call()` could not take it right away.
+async fn acquire(
+    locked: Result<MutexGuardArc<PgConn>, Arc<Mutex<PgConn>>>,
+    state: &Arc<PgConnectionState>,
+) -> MutexGuardArc<PgConn> {
+    match locked {
+        Ok(conn) => conn,
+        Err(conn) => lock(conn, state.clone()).await,
     }
 }
 
@@ -121,7 +148,7 @@ async fn end_transaction(
     let depth = state.transaction_depth();
 
     if depth > 0 {
-        let mut stream = pin!(conn.run(statement, None, false, None).await?);
+        let mut stream = pin!(PgConn::run(&mut *conn, statement, None, false, None).await?);
         while stream.try_next().await?.is_some() {}
 
         state.set_transaction_depth(depth - 1);

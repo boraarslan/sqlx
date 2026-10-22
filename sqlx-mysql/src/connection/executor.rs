@@ -23,6 +23,7 @@ use futures_core::Stream;
 use sqlx_core::column::{ColumnOrigin, TableColumn};
 use sqlx_core::middleware::{Request, Response};
 use sqlx_core::sql_str::SqlStr;
+use std::ops::DerefMut;
 use std::sync::Arc;
 
 impl MySqlConn {
@@ -99,18 +100,27 @@ impl MySqlConn {
         Ok((id, metadata))
     }
 
-    #[allow(clippy::needless_lifetimes)]
-    pub(crate) async fn run<'e, 'c: 'e, 'q: 'e>(
-        &'c mut self,
+    /// Execute a query and return a stream of its results.
+    ///
+    /// `conn` is either `&mut MySqlConn` or an owned lock guard of the connection,
+    /// in which case the returned stream is `'static` and keeps the connection locked.
+    ///
+    /// If `first_row_only` is set, the stream ends after the first row;
+    /// the rest of the response is discarded before the next query.
+    pub(crate) async fn run<'e, C>(
+        mut conn: C,
         sql: SqlStr,
         arguments: Option<MySqlArguments>,
         persistent: bool,
+        first_row_only: bool,
     ) -> Result<impl Stream<Item = Result<Either<MySqlQueryResult, MySqlRow>, Error>> + 'e, Error>
+    where
+        C: DerefMut<Target = MySqlConn> + Send + 'e,
     {
-        let mut logger = QueryLogger::new(sql, self.inner.log_settings.clone());
+        let mut logger = QueryLogger::new(sql, conn.inner.log_settings.clone());
 
-        self.inner.stream.wait_until_ready().await?;
-        self.inner.stream.waiting.push_back(Waiting::Result);
+        conn.inner.stream.wait_until_ready().await?;
+        conn.inner.stream.waiting.push_back(Waiting::Result);
 
         Ok(try_stream! {
         let sql = logger.sql().as_str();
@@ -121,8 +131,8 @@ impl MySqlConn {
             let mut columns = Arc::new(Vec::new());
 
             let format = if let Some(arguments) = arguments {
-                if persistent && self.inner.cache_statement.is_enabled() {
-                    let (id, metadata) = self
+                if persistent && conn.inner.cache_statement.is_enabled() {
+                    let (id, metadata) = conn
                         .get_or_prepare_statement(sql)
                         .await?;
 
@@ -137,7 +147,7 @@ impl MySqlConn {
                     }
 
                     // https://dev.mysql.com/doc/internals/en/com-stmt-execute.html
-                    self.inner.stream
+                    conn.inner.stream
                         .send_packet(StatementExecute {
                             statement: id,
                             arguments: &arguments,
@@ -146,7 +156,7 @@ impl MySqlConn {
 
                     MySqlValueFormat::Binary
                 } else {
-                    let (id, metadata) = self
+                    let (id, metadata) = conn
                         .prepare_statement(sql)
                         .await?;
 
@@ -161,20 +171,20 @@ impl MySqlConn {
                     }
 
                     // https://dev.mysql.com/doc/internals/en/com-stmt-execute.html
-                    self.inner.stream
+                    conn.inner.stream
                         .send_packet(StatementExecute {
                             statement: id,
                             arguments: &arguments,
                         })
                         .await?;
 
-                    self.inner.stream.send_packet(StmtClose { statement: id }).await?;
+                    conn.inner.stream.send_packet(StmtClose { statement: id }).await?;
 
                     MySqlValueFormat::Binary
                 }
             } else {
                 // https://dev.mysql.com/doc/internals/en/com-query.html
-                self.inner.stream.send_packet(Query(sql)).await?;
+                conn.inner.stream.send_packet(Query(sql)).await?;
 
                 MySqlValueFormat::Text
             };
@@ -182,14 +192,14 @@ impl MySqlConn {
             loop {
                 // query response is a meta-packet which may be one of:
                 //  Ok, Err, ResultSet, or (unhandled) LocalInfileRequest
-                let mut packet = self.inner.stream.recv_packet().await?;
+                let mut packet = conn.inner.stream.recv_packet().await?;
 
                 if packet[0] == 0x00 || packet[0] == 0xff {
                     // first packet in a query response is OK or ERR
                     // this indicates either a successful query with no rows at all or a failed query
                     let ok = packet.ok()?;
 
-                    self.inner.status_flags = ok.status;
+                    conn.inner.status_flags = ok.status;
 
                     let rows_affected = ok.affected_rows;
                     logger.increase_rows_affected(rows_affected);
@@ -205,12 +215,12 @@ impl MySqlConn {
                         continue;
                     }
 
-                    self.inner.stream.waiting.pop_front();
+                    conn.inner.stream.waiting.pop_front();
                     return Ok(());
                 }
 
                 // otherwise, this first packet is the start of the result-set metadata,
-                *self.inner.stream.waiting.front_mut().unwrap() = Waiting::Row;
+                *conn.inner.stream.waiting.front_mut().unwrap() = Waiting::Row;
 
                 let num_columns = packet.get_uint_lenenc()?; // column count
                 let num_columns = usize::try_from(num_columns)
@@ -218,16 +228,16 @@ impl MySqlConn {
 
                 // Always reload column names, even for prepared statements (the schema
                 // may change between PREPARE and EXECUTE).
-                let column_names = Arc::new(recv_result_metadata(&mut self.inner.stream, num_columns, Arc::make_mut(&mut columns)).await?);
+                let column_names = Arc::new(recv_result_metadata(&mut conn.inner.stream, num_columns, Arc::make_mut(&mut columns)).await?);
 
                 // finally, there will be none or many result-rows
                 loop {
-                    let packet = self.inner.stream.recv_packet().await?;
+                    let packet = conn.inner.stream.recv_packet().await?;
 
                     if packet[0] == 0xfe {
                         let (rows_affected, last_insert_id, status) = if packet.len() < 9 {
                             // EOF packet
-                            let eof = packet.eof(self.inner.stream.capabilities)?;
+                            let eof = packet.eof(conn.inner.stream.capabilities)?;
                             (0, 0, eof.status)
                         } else {
                             // OK packet
@@ -235,17 +245,17 @@ impl MySqlConn {
                             (ok.affected_rows, ok.last_insert_id, ok.status)
                         };
 
-                        self.inner.status_flags = status;
+                        conn.inner.status_flags = status;
                         r#yield!(Either::Left(MySqlQueryResult {
                             rows_affected,
                             last_insert_id,
                         }));
 
                         if status.contains(Status::SERVER_MORE_RESULTS_EXISTS) {
-                            *self.inner.stream.waiting.front_mut().unwrap() = Waiting::Result;
+                            *conn.inner.stream.waiting.front_mut().unwrap() = Waiting::Result;
                             break;
                         }
-                        self.inner.stream.waiting.pop_front();
+                        conn.inner.stream.waiting.pop_front();
                         return Ok(());
                     }
 
@@ -264,6 +274,10 @@ impl MySqlConn {
                     logger.increment_rows_returned();
 
                     r#yield!(v);
+
+                    if first_row_only {
+                        return Ok(());
+                    }
                 }
             }
         })

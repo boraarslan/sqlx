@@ -26,8 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `ConnectOptions::connection_info()`), and `Request::transaction_depth()` the transaction state of the connection.
 
 ### Breaking
-* `Executor::dispatch()` is now the only required method of `Executor`; all other methods are provided.
-  Implementations of `Executor` outside of SQLx must implement `dispatch()`.
+* All methods of `Executor` are now implemented in terms of the new `Executor::dispatch()`. Existing implementations
+  (which implement `fetch_many()`, `fetch_optional()`, `prepare_with()` and `describe()`) keep working, as `dispatch()`
+  has a default implementation that returns an error, but they should implement `dispatch()` instead, which is
+  required to use them with middleware APIs like `ServiceExecutor`.
 * `ConnectOptions` has the new required methods `layers()` and `layers_mut()`.
 * `AnyConnectionBackend` replaces `fetch_many()`, `fetch_optional()`, `prepare_with()`, `describe()`, `begin()`,
   `commit()` and `rollback()` with `service()`, which returns a `'static` request service.

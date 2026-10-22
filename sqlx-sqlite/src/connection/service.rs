@@ -1,8 +1,9 @@
+use std::future;
 use std::task::{Context, Poll};
 
 use futures_core::future::BoxFuture;
 use sqlx_core::error::Error;
-use sqlx_core::middleware::{Request, RequestKind, Response, ResultStream, Service};
+use sqlx_core::middleware::{Request, RequestKind, RequestParts, Response, ResultStream, Service};
 
 use crate::connection::worker::ConnectionWorker;
 use crate::Sqlite;
@@ -29,50 +30,56 @@ impl Service<Request<Sqlite>> for SqliteDriver {
 
     fn call(&mut self, request: Request<Sqlite>) -> Self::Future {
         let worker = self.worker.clone();
-        let row_channel_size = self.row_channel_size;
 
-        Box::pin(async move {
-            let request = request.into_parts();
+        let RequestParts {
+            kind,
+            sql,
+            arguments,
+            persistent,
+            ..
+        } = request.into_parts();
 
-            match request.kind {
-                RequestKind::Fetch | RequestKind::FetchOptional => {
-                    let persistent = request.persistent && request.arguments.is_some();
-                    let limit = (request.kind == RequestKind::FetchOptional).then_some(1);
+        // Each kind of request has its own future, so that the common ones stay small.
+        match kind {
+            RequestKind::Fetch | RequestKind::FetchOptional => {
+                let row_channel_size = self.row_channel_size;
+
+                Box::pin(async move {
+                    let persistent = persistent && arguments.is_some();
+                    let limit = (kind == RequestKind::FetchOptional).then_some(1);
 
                     let rows = worker
-                        .execute(
-                            request.sql,
-                            request.arguments,
-                            row_channel_size,
-                            persistent,
-                            limit,
-                        )
+                        .execute(sql, arguments, row_channel_size, persistent, limit)
                         .await?;
 
                     ResultStream::new(rows.into_stream())
                         .prefetch()
                         .await
                         .map(Response::Stream)
-                }
-                RequestKind::Prepare => worker.prepare(request.sql).await.map(Response::Statement),
-                #[cfg(feature = "offline")]
-                RequestKind::Describe => worker.describe(request.sql).await.map(Response::Describe),
-                RequestKind::Begin => {
-                    worker.begin(request.sql).await?;
-                    Ok(Response::Done)
-                }
-                RequestKind::Commit => {
-                    worker.commit(request.sql).await?;
-                    Ok(Response::Done)
-                }
-                RequestKind::Rollback => {
-                    worker.rollback(request.sql).await?;
-                    Ok(Response::Done)
-                }
-                kind => Err(Error::InvalidArgument(format!(
-                    "unsupported request kind for SQLite: {kind:?}"
-                ))),
+                })
             }
-        })
+            RequestKind::Prepare => {
+                Box::pin(async move { worker.prepare(sql).await.map(Response::Statement) })
+            }
+            #[cfg(feature = "offline")]
+            RequestKind::Describe => {
+                Box::pin(async move { worker.describe(sql).await.map(Response::Describe) })
+            }
+            RequestKind::Begin => Box::pin(async move {
+                worker.begin(sql).await?;
+                Ok(Response::Done)
+            }),
+            RequestKind::Commit => Box::pin(async move {
+                worker.commit(sql).await?;
+                Ok(Response::Done)
+            }),
+            RequestKind::Rollback => Box::pin(async move {
+                worker.rollback(sql).await?;
+                Ok(Response::Done)
+            }),
+            kind => Box::pin(future::ready(Err(Error::InvalidArgument(format!(
+                "unsupported request kind for SQLite: {kind:?}"
+            ))))),
+        }
     }
 }

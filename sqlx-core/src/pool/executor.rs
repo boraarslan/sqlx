@@ -20,7 +20,7 @@ where
 {
     type Database = DB;
 
-    fn dispatch<'e>(self, request: Request<DB>) -> BoxFuture<'e, Result<Response<DB>, Error>>
+    fn dispatch<'e>(self, mut request: Request<DB>) -> BoxFuture<'e, Result<Response<DB>, Error>>
     where
         'p: 'e,
     {
@@ -29,14 +29,13 @@ where
         Box::pin(async move {
             match service(&pool.0) {
                 Some(service) => {
-                    let mut request = request;
                     request.set_connection_info(pool.0.connection_info());
 
                     let mut service = service.clone();
                     poll_fn(|cx| service.poll_ready(cx)).await?;
                     service.call(request).await
                 }
-                None => acquire_and_dispatch(Pool(pool.0), request).await,
+                None => acquire_and_dispatch(pool, request).await,
             }
         })
     }
@@ -58,8 +57,8 @@ where
 
     #[inline]
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // Readiness of the middleware stack is checked for each request,
-        // as it is cloned for each request.
+        // The middleware stack is shared by all users of the pool, so its readiness is
+        // awaited by the response future, through its own handle to the stack.
         Poll::Ready(Ok(()))
     }
 

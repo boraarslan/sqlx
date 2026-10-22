@@ -3,7 +3,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::future::{self, poll_fn, Future};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{ready, Context, Poll, Waker};
 
 use async_lock::futures::LockArc;
 use async_lock::{Mutex, MutexGuardArc};
@@ -263,9 +263,11 @@ impl<S> Debug for Layers<S> {
 /// `D` is the driver's innermost service, which actually talks to the database.
 /// If no layers were configured, requests are sent to it directly, without type erasure.
 ///
-/// The driver service is expected to always be ready (its `poll_ready()` is not called).
+/// The driver service is expected to be ready almost always: if it's not ready immediately,
+/// requests sent with [`dispatch()`][Self::dispatch] need an extra allocation.
 ///
-/// Before a request enters the stack, its [`ConnectionInfo`] and transaction depth are set.
+/// Before a request enters the middleware stack, its [`ConnectionInfo`] and transaction depth
+/// are set.
 #[doc(hidden)]
 pub struct ConnectionService<DB: Database, D> {
     stack: Stack<DB, D>,
@@ -305,15 +307,30 @@ where
         mut request: Request<DB>,
         transaction_depth: usize,
     ) -> BoxFuture<'_, Result<Response<DB>, Error>> {
-        self.prepare(&mut request, transaction_depth);
-
         match &mut self.stack {
-            // The driver service is always ready, so we can skip the extra allocation.
-            Stack::Driver(driver) => driver.call(request),
-            Stack::Layered(service) => Box::pin(async move {
-                poll_fn(|cx| service.poll_ready(cx)).await?;
-                service.call(request).await
-            }),
+            // The driver service doesn't read the connection info or transaction depth.
+            Stack::Driver(driver) => {
+                // Driver services are usually always ready, which lets us skip the extra
+                // allocation. A type-erased driver (like that of `AnyConnection`) may still
+                // need `poll_ready()` to be called, however.
+                match driver.poll_ready(&mut Context::from_waker(Waker::noop())) {
+                    Poll::Ready(Ok(())) => driver.call(request),
+                    Poll::Ready(Err(e)) => Box::pin(future::ready(Err(e))),
+                    Poll::Pending => Box::pin(async move {
+                        poll_fn(|cx| driver.poll_ready(cx)).await?;
+                        driver.call(request).await
+                    }),
+                }
+            }
+            Stack::Layered(service) => {
+                request.set_connection_info(self.info.clone());
+                request.set_transaction_depth(transaction_depth);
+
+                Box::pin(async move {
+                    poll_fn(|cx| service.poll_ready(cx)).await?;
+                    service.call(request).await
+                })
+            }
         }
     }
 
@@ -327,13 +344,17 @@ where
     }
 
     /// See [`Service::call()`].
+    ///
+    /// Unlike [`dispatch()`][Self::dispatch], this always sets the connection info and
+    /// transaction depth of the request, as the caller may be middleware which reads them.
     #[inline]
     pub fn call(
         &mut self,
         mut request: Request<DB>,
         transaction_depth: usize,
     ) -> BoxFuture<'static, Result<Response<DB>, Error>> {
-        self.prepare(&mut request, transaction_depth);
+        request.set_connection_info(self.info.clone());
+        request.set_transaction_depth(transaction_depth);
 
         match &mut self.stack {
             Stack::Driver(driver) => driver.call(request),
@@ -349,12 +370,6 @@ where
     /// Returns `true` if any layers were configured.
     pub fn is_layered(&self) -> bool {
         matches!(self.stack, Stack::Layered(_))
-    }
-
-    #[inline]
-    fn prepare(&self, request: &mut Request<DB>, transaction_depth: usize) {
-        request.set_connection_info(self.info.clone());
-        request.set_transaction_depth(transaction_depth);
     }
 }
 

@@ -29,6 +29,18 @@ use crate::middleware::{into_sqlx_error, Request, Response, Service};
 /// # }
 /// ```
 ///
+/// A single layer can also be applied directly with [`Layer::layer()`][super::Layer::layer]:
+///
+/// ```rust,no_run
+/// # async fn example(conn: &mut sqlx::PgConnection) -> sqlx::Result<()> {
+/// use sqlx::middleware::{trace::TraceLayer, Layer, ServiceExecutor};
+///
+/// let mut executor = ServiceExecutor::new(TraceLayer::new().layer(&mut *conn));
+/// sqlx::query("SELECT 1").execute(&mut executor).await?;
+/// # Ok(())
+/// # }
+/// ```
+///
 /// [`Executor`] is implemented for `&mut ServiceExecutor`, and also for `&ServiceExecutor`
 /// if the service is `Clone + Sync`. In the latter case, the service is cloned for each request,
 /// like [`Pool`][crate::pool::Pool].

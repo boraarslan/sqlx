@@ -15,7 +15,7 @@ use sqlx_core::transaction::rollback_ansi_transaction_sql;
 
 use crate::HashMap;
 
-use crate::common::StatementCache;
+use crate::common::{PendingQueries, StatementCache};
 use crate::error::Error;
 use crate::ext::ustr::UStr;
 use crate::io::StatementId;
@@ -70,7 +70,7 @@ pub(crate) struct PgConnectionState {
     /// after its request completed.
     ///
     /// These are queued on the connection the next time it is locked.
-    pending_queries: std::sync::Mutex<Vec<SqlStr>>,
+    pending_queries: PendingQueries,
 
     server_version_num: Option<u32>,
 }
@@ -223,21 +223,12 @@ impl PgConnectionState {
             Some(conn) => conn
                 .queue_simple_query(query.as_str())
                 .expect("BUG: queued query somehow too large for protocol"),
-            None => self
-                .pending_queries
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(query),
+            None => self.pending_queries.push(query),
         }
     }
 
-    fn queue_pending_queries(&self, conn: &mut PgConn) {
-        let mut pending = self
-            .pending_queries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        for query in pending.drain(..) {
+    pub(crate) fn queue_pending_queries(&self, conn: &mut PgConn) {
+        for query in self.pending_queries.take() {
             conn.queue_simple_query(query.as_str())
                 .expect("BUG: queued query somehow too large for protocol");
         }

@@ -34,8 +34,8 @@ pub trait AnyConnectionBackend: std::any::Any + Debug + Send + 'static {
     /// transaction control requests, for which it must maintain the transaction depth
     /// returned by [`get_transaction_depth()`][Self::get_transaction_depth].
     ///
-    /// The service is expected to always be ready: its `poll_ready()` is not called
-    /// when no middleware is configured.
+    /// The service should be ready immediately whenever the connection is not in use,
+    /// as requests then avoid an extra allocation.
     fn service(&mut self) -> BoxService<Any>;
 
     /// Queue a `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`) for the current transaction depth

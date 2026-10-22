@@ -1,5 +1,7 @@
+mod pending_queries;
 mod statement_cache;
 
+pub use pending_queries::PendingQueries;
 pub use statement_cache::StatementCache;
 use std::fmt::{Debug, Formatter};
 use std::ops::{Deref, DerefMut};

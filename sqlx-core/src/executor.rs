@@ -28,7 +28,7 @@ use std::{fmt::Debug, future};
 /// # Middleware
 /// All methods of this trait are implemented on top of [`dispatch()`][Self::dispatch], which
 /// sends a [`Request`] through the [middleware](crate::middleware) stack of the
-/// connection or pool. To implement this trait, only `dispatch()` is required.
+/// connection or pool. To implement this trait, only `dispatch()` needs to be implemented.
 ///
 /// The [`Executor`] impls for [`Transaction`](crate::transaction::Transaction)
 /// and [`PoolConnection`](crate::pool::PoolConnection) have been deleted because they
@@ -63,19 +63,34 @@ pub trait Executor<'c>: Send + Debug + Sized {
 
     /// Send a [`Request`] through this executor's middleware stack to the database.
     ///
-    /// This is the only required method; all other methods are implemented in terms of it.
+    /// All other methods are implemented in terms of this one, so it's the only method
+    /// implementations need to provide.
     ///
     /// The returned future completes when the database starts responding; the rows of a query
     /// are then streamed through the [`ResultStream`][crate::middleware::ResultStream]
     /// in the [`Response`].
     ///
     /// See the [`middleware`][crate::middleware] module for details.
+    ///
+    /// # Compatibility
+    /// To keep implementations written before this method was added working, the default
+    /// implementation returns an error. Such implementations must override
+    /// [`fetch_many()`][Self::fetch_many], [`fetch_optional()`][Self::fetch_optional],
+    /// [`prepare_with()`][Self::prepare_with] and `describe()`; they cannot be used with
+    /// [`ServiceExecutor`][crate::middleware::ServiceExecutor] or other APIs that call `dispatch()`.
     fn dispatch<'e>(
         self,
         request: Request<Self::Database>,
     ) -> BoxFuture<'e, Result<Response<Self::Database>, Error>>
     where
-        'c: 'e;
+        'c: 'e,
+    {
+        Box::pin(future::ready(Err(Error::InvalidArgument(format!(
+            "`Executor::dispatch()` is not implemented for {}; cannot execute {:?}",
+            std::any::type_name::<Self>(),
+            request.kind()
+        )))))
+    }
 
     /// Execute the query and return the total number of rows affected.
     fn execute<'e, 'q: 'e, E>(
@@ -187,8 +202,8 @@ pub trait Executor<'c>: Send + Debug + Sized {
 
     /// Execute the query and returns at most one row.
     ///
-    /// Drivers may stop reading rows after the first, but any errors which occur before then
-    /// (including from rows which are discarded) are returned.
+    /// Drivers may stop reading the response after the first row; any error received up to
+    /// that point is returned, even if it follows the first row.
     fn fetch_optional<'e, 'q: 'e, E>(
         self,
         query: E,

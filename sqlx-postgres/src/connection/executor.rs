@@ -21,6 +21,7 @@ use sqlx_core::middleware::{Request, Response};
 use sqlx_core::sql_str::SqlStr;
 use sqlx_core::Either;
 use std::future;
+use std::ops::DerefMut;
 use std::{pin::pin, sync::Arc};
 
 async fn prepare(
@@ -309,31 +310,38 @@ impl PgConn {
         Ok((format, metadata))
     }
 
-    pub(crate) async fn run<'e, 'c: 'e, 'q: 'e>(
-        &'c mut self,
+    /// Execute a query and return a stream of its results.
+    ///
+    /// `conn` is either `&mut PgConn` or an owned lock guard of the connection,
+    /// in which case the returned stream is `'static` and keeps the connection locked.
+    pub(crate) async fn run<'e, C>(
+        mut conn: C,
         query: SqlStr,
         mut arguments: Option<PgArguments>,
         persistent: bool,
         metadata_opt: Option<Arc<PgStatementMetadata>>,
-    ) -> Result<impl Stream<Item = Result<Either<PgQueryResult, PgRow>, Error>> + 'e, Error> {
-        let mut logger = QueryLogger::new(query, self.inner.log_settings.clone());
+    ) -> Result<impl Stream<Item = Result<Either<PgQueryResult, PgRow>, Error>> + 'e, Error>
+    where
+        C: DerefMut<Target = PgConn> + Send + 'e,
+    {
+        let mut logger = QueryLogger::new(query, conn.inner.log_settings.clone());
         let sql = logger.sql().as_str();
 
         // before we continue, wait until we are "ready" to accept more queries
-        self.wait_until_ready().await?;
+        conn.wait_until_ready().await?;
 
-        let (mut format, mut metadata) = self
+        let (mut format, mut metadata) = conn
             .try_get_or_prepare(sql, arguments.as_mut(), persistent, metadata_opt.clone())
             .await?;
 
-        let mut message = match self.inner.stream.recv().await {
+        let mut message = match conn.inner.stream.recv().await {
             Ok(msg) => msg,
             Err(err) => {
                 if let Some(clear_backend_cache) = check_stale_plan(&err) {
                     // Save transaction mode. It will be lost after invalidating
-                    let is_in_tx = self.in_transaction();
+                    let is_in_tx = conn.in_transaction();
 
-                    self.invalidate_cached_statement(sql, clear_backend_cache)
+                    conn.invalidate_cached_statement(sql, clear_backend_cache)
                         .await?;
 
                     // If we were in transaction mode we can't retry statement,
@@ -343,7 +351,7 @@ impl PgConn {
                     }
 
                     // Otherwise we can retry statement in hope everything is ok.
-                    (format, metadata) = self
+                    (format, metadata) = conn
                         .try_get_or_prepare(
                             sql,
                             // It should be safe to retry `patch` on the same arguments
@@ -353,7 +361,7 @@ impl PgConn {
                         )
                         .await?;
 
-                    self.inner.stream.recv().await?
+                    conn.inner.stream.recv().await?
                 } else {
                     return Err(err);
                 }
@@ -399,7 +407,7 @@ impl PgConn {
 
                     // indicates that a *new* set of rows are about to be returned
                     BackendMessageFormat::RowDescription => {
-                        let (new_metadata, _) = self.resolve_statement_metadata::<false>(
+                        let (new_metadata, _) = conn.resolve_statement_metadata::<false>(
                             None,
                             Some(message.decode()?),
                             false,
@@ -424,7 +432,7 @@ impl PgConn {
 
                     BackendMessageFormat::ReadyForQuery => {
                         // processing of the query string is complete
-                        self.handle_ready_for_query(message)?;
+                        conn.handle_ready_for_query(message)?;
                         break;
                     }
 
@@ -436,7 +444,7 @@ impl PgConn {
                     }
                 }
 
-                message = self.inner.stream.recv().await?;
+                message = conn.inner.stream.recv().await?;
             }
 
             Ok(())
@@ -538,7 +546,7 @@ impl<'c> Executor<'c> for &'c mut PgConn {
 
         Box::pin(try_stream! {
             let arguments = arguments?;
-            let mut s = pin!(self.run(sql, arguments, persistent, metadata).await?);
+            let mut s = pin!(PgConn::run(self, sql, arguments, persistent, metadata).await?);
 
             while let Some(v) = s.try_next().await? {
                 r#yield!(v);
@@ -564,7 +572,7 @@ impl<'c> Executor<'c> for &'c mut PgConn {
         Box::pin(async move {
             let sql = query.sql();
             let arguments = arguments?;
-            let mut s = pin!(self.run(sql, arguments, persistent, metadata).await?);
+            let mut s = pin!(PgConn::run(self, sql, arguments, persistent, metadata).await?);
 
             // With deferred constraints we need to check all responses as we
             // could get a OK response (with uncommitted data), only to get an

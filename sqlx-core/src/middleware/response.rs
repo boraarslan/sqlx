@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::fmt::{self, Debug, Formatter};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -10,6 +11,7 @@ use futures_util::StreamExt;
 use crate::database::Database;
 use crate::describe::Describe;
 use crate::error::Error;
+use crate::ext::async_stream::TryAsyncStream;
 
 /// The response to a [`Request`][super::Request].
 ///
@@ -112,7 +114,15 @@ pub type ResultItem<DB> =
 pub struct ResultStream<DB: Database> {
     // An item that was read ahead of time by `prefetch()`.
     first: Option<Either<DB::QueryResult, DB::Row>>,
-    inner: Option<BoxStream<'static, ResultItem<DB>>>,
+    inner: Inner<DB>,
+}
+
+enum Inner<DB: Database> {
+    Finished,
+    // The streams of the built-in drivers, which are not boxed again as they already box
+    // their state internally.
+    Native(TryAsyncStream<'static, Either<DB::QueryResult, DB::Row>>),
+    Boxed(BoxStream<'static, ResultItem<DB>>),
 }
 
 impl<DB: Database> ResultStream<DB> {
@@ -121,14 +131,25 @@ impl<DB: Database> ResultStream<DB> {
     where
         S: Stream<Item = ResultItem<DB>> + Send + 'static,
     {
-        Self::from_boxed(Box::pin(stream))
+        let mut stream = Some(stream);
+
+        if let Some(native) = (&mut stream as &mut dyn Any)
+            .downcast_mut::<Option<TryAsyncStream<'static, Either<DB::QueryResult, DB::Row>>>>()
+        {
+            return Self {
+                first: None,
+                inner: Inner::Native(native.take().expect("BUG: stream already taken")),
+            };
+        }
+
+        Self::from_boxed(Box::pin(stream.take().expect("BUG: stream already taken")))
     }
 
     /// Wrap an already-boxed stream of results and rows without boxing it again.
     pub fn from_boxed(stream: BoxStream<'static, ResultItem<DB>>) -> Self {
         Self {
             first: None,
-            inner: Some(stream),
+            inner: Inner::Boxed(stream),
         }
     }
 
@@ -136,7 +157,7 @@ impl<DB: Database> ResultStream<DB> {
     pub fn empty() -> Self {
         Self {
             first: None,
-            inner: None,
+            inner: Inner::Finished,
         }
     }
 
@@ -153,17 +174,13 @@ impl<DB: Database> ResultStream<DB> {
             return Ok(self);
         }
 
-        let Some(inner) = &mut self.inner else {
-            return Ok(self);
-        };
-
-        match inner.next().await {
+        match self.next().await {
             Some(Ok(first)) => {
                 self.first = Some(first);
                 Ok(self)
             }
             Some(Err(e)) => Err(e),
-            None => Ok(Self::empty()),
+            None => Ok(self),
         }
     }
 
@@ -172,14 +189,14 @@ impl<DB: Database> ResultStream<DB> {
         match self {
             Self {
                 first: None,
-                inner: Some(inner),
+                inner: Inner::Boxed(inner),
             } => inner,
             this => Box::pin(this),
         }
     }
 }
 
-// We never pin-project into `first`, and `inner` is already boxed and pinned.
+// We never pin-project into the fields, and the streams are `Unpin`.
 impl<DB: Database> Unpin for ResultStream<DB> {}
 
 impl<DB: Database> Stream for ResultStream<DB> {
@@ -190,15 +207,15 @@ impl<DB: Database> Stream for ResultStream<DB> {
             return Poll::Ready(Some(Ok(first)));
         }
 
-        let Some(inner) = &mut self.inner else {
-            return Poll::Ready(None);
+        let res = match &mut self.inner {
+            Inner::Finished => return Poll::Ready(None),
+            Inner::Native(inner) => inner.poll_next_unpin(cx),
+            Inner::Boxed(inner) => inner.as_mut().poll_next(cx),
         };
-
-        let res = inner.as_mut().poll_next(cx);
 
         if let Poll::Ready(None) = res {
             // Release the underlying stream (and the connection it holds) as soon as possible.
-            self.inner = None;
+            self.inner = Inner::Finished;
         }
 
         res
@@ -207,16 +224,16 @@ impl<DB: Database> Stream for ResultStream<DB> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let first = usize::from(self.first.is_some());
 
-        match &self.inner {
-            Some(inner) => {
-                let (lower, upper) = inner.size_hint();
-                (
-                    lower.saturating_add(first),
-                    upper.and_then(|upper| upper.checked_add(first)),
-                )
-            }
-            None => (first, Some(first)),
-        }
+        let (lower, upper) = match &self.inner {
+            Inner::Finished => (0, Some(0)),
+            Inner::Native(inner) => inner.size_hint(),
+            Inner::Boxed(inner) => inner.size_hint(),
+        };
+
+        (
+            lower.saturating_add(first),
+            upper.and_then(|upper| upper.checked_add(first)),
+        )
     }
 }
 
@@ -224,7 +241,7 @@ impl<DB: Database> Debug for ResultStream<DB> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("ResultStream")
             .field("prefetched", &self.first.is_some())
-            .field("finished", &self.inner.is_none())
+            .field("finished", &matches!(self.inner, Inner::Finished))
             .finish()
     }
 }
