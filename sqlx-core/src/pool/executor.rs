@@ -3,16 +3,19 @@ use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
+use either::Either;
 use futures_core::future::BoxFuture;
+use futures_core::stream::BoxStream;
 use futures_core::Stream;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 
 use crate::database::Database;
 use crate::error::Error;
-use crate::executor::Executor;
+use crate::executor::{provided, Execute, Executor};
 use crate::middleware::{BoxService, Request, Response, ResultItem, ResultStream, Service};
 use crate::pool::inner::PoolInner;
 use crate::pool::{Pool, PoolConnection};
+use crate::sql_str::SqlStr;
 
 impl<'p, DB: Database> Executor<'p> for &'_ Pool<DB>
 where
@@ -38,6 +41,87 @@ where
                 None => acquire_and_dispatch(pool, request).await,
             }
         })
+    }
+
+    // Without pool middleware, queries are passed to the methods of the connection, so that
+    // connections whose `Executor` doesn't implement `dispatch()` keep working.
+
+    fn fetch_many<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> BoxStream<'e, Result<Either<DB::QueryResult, DB::Row>, Error>>
+    where
+        'p: 'e,
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        if !self.0.options.layers.is_empty() {
+            return provided::fetch_many(self, query);
+        }
+
+        let pool = self.clone();
+
+        Box::pin(try_stream! {
+            let mut conn = pool.acquire().await?;
+            let mut s = conn.fetch_many(query);
+
+            while let Some(v) = s.try_next().await? {
+                r#yield!(v);
+            }
+
+            Ok(())
+        })
+    }
+
+    fn fetch_optional<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> BoxFuture<'e, Result<Option<DB::Row>, Error>>
+    where
+        'p: 'e,
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        if !self.0.options.layers.is_empty() {
+            return provided::fetch_optional(self, query);
+        }
+
+        let pool = self.clone();
+
+        Box::pin(async move { pool.acquire().await?.fetch_optional(query).await })
+    }
+
+    fn prepare_with<'e>(
+        self,
+        sql: SqlStr,
+        parameters: &'e [<Self::Database as Database>::TypeInfo],
+    ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement, Error>>
+    where
+        'p: 'e,
+    {
+        if !self.0.options.layers.is_empty() {
+            return provided::prepare_with(self, sql, parameters);
+        }
+
+        let pool = self.clone();
+
+        Box::pin(async move { pool.acquire().await?.prepare_with(sql, parameters).await })
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "offline")]
+    fn describe<'e>(
+        self,
+        sql: SqlStr,
+    ) -> BoxFuture<'e, Result<crate::describe::Describe<Self::Database>, Error>>
+    where
+        'p: 'e,
+    {
+        if !self.0.options.layers.is_empty() {
+            return provided::describe(self, sql);
+        }
+
+        let pool = self.clone();
+
+        Box::pin(async move { pool.acquire().await?.describe(sql).await })
     }
 }
 

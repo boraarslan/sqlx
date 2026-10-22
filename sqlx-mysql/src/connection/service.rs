@@ -86,25 +86,16 @@ impl Service<Request<MySql>> for MySqlDriver {
             }),
             RequestKind::Begin => Box::pin(async move {
                 let mut conn = acquire(locked, &state).await;
-                let depth = state.transaction_depth();
-
-                execute(&mut conn, sql).await?;
-
-                if !conn.in_transaction() {
-                    return Err(Error::BeginFailed);
-                }
-
-                state.set_transaction_depth(depth + 1);
+                begin(&mut conn, &state, sql).await?;
 
                 Ok(Response::Done)
             }),
             RequestKind::Commit | RequestKind::Rollback => Box::pin(async move {
                 let mut conn = acquire(locked, &state).await;
-                let depth = state.transaction_depth();
 
-                if depth > 0 {
+                if state.transaction_depth() > 0 {
                     execute(&mut conn, sql).await?;
-                    state.set_transaction_depth(depth - 1);
+                    state.decrement_transaction_depth();
                 }
 
                 Ok(Response::Done)
@@ -124,6 +115,56 @@ async fn acquire(
     match locked {
         Ok(conn) => conn,
         Err(conn) => lock(conn, state.clone()).await,
+    }
+}
+
+async fn begin(
+    conn: &mut MySqlConn,
+    state: &MySqlConnectionState,
+    statement: SqlStr,
+) -> Result<(), Error> {
+    // Claim the depth before the round trip, not after: if this future is cancelled while
+    // waiting for the response, the guard queues a `ROLLBACK`, so that the connection is not
+    // left in a transaction that nothing will end (see the Postgres driver).
+    state.increment_transaction_depth();
+    let mut rollback = Rollback {
+        conn,
+        state,
+        defused: false,
+    };
+
+    let res = execute(rollback.conn, statement).await;
+
+    // The statement completed, so there is no need to roll back if it failed or didn't start a
+    // transaction. (`execute()` receives the responses to statements sent earlier before sending
+    // this one, so an error from them means this one was not sent.)
+    rollback.defused = true;
+
+    if let Err(e) = res {
+        state.decrement_transaction_depth();
+        return Err(e);
+    }
+
+    if !rollback.conn.in_transaction() {
+        state.decrement_transaction_depth();
+        return Err(Error::BeginFailed);
+    }
+
+    Ok(())
+}
+
+/// Rolls back the transaction claimed by [`begin()`] if dropped before being defused.
+struct Rollback<'c> {
+    conn: &'c mut MySqlConn,
+    state: &'c MySqlConnectionState,
+    defused: bool,
+}
+
+impl Drop for Rollback<'_> {
+    fn drop(&mut self) {
+        if !self.defused {
+            self.state.start_rollback(Some(self.conn));
+        }
     }
 }
 

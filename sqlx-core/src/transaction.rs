@@ -6,6 +6,7 @@ use futures_core::future::BoxFuture;
 
 use crate::database::Database;
 use crate::error::Error;
+use crate::middleware::RequestKind;
 use crate::pool::MaybePoolConnection;
 use crate::sql_str::{AssertSqlSafe, SqlSafeStr, SqlStr};
 
@@ -89,6 +90,8 @@ where
 {
     connection: MaybePoolConnection<'c, DB>,
     open: bool,
+    /// The transaction depth of the connection while this transaction is open.
+    depth: usize,
 }
 
 impl<'c, DB> Transaction<'c, DB>
@@ -103,11 +106,14 @@ where
         let conn = conn.into();
 
         Box::pin(async move {
+            let depth = DB::TransactionManager::get_transaction_depth(&conn) + 1;
+
             let mut tx = Self {
                 connection: conn,
 
                 // If the call to `begin` fails or doesn't complete we want to attempt a rollback in case the transaction was started.
                 open: true,
+                depth,
             };
 
             DB::TransactionManager::begin(&mut tx.connection, statement).await?;
@@ -267,7 +273,17 @@ where
     DB: Database,
 {
     fn drop(&mut self) {
-        if self.open {
+        if !self.open {
+            return;
+        }
+
+        // Only roll back if this transaction (or one nested in it) is still open: the depth is
+        // lower if `begin()` didn't take effect, or if the database already executed `COMMIT` or
+        // `ROLLBACK` even though `commit()` or `rollback()` returned an error (e.g. from
+        // middleware), in which case rolling back would end the parent transaction instead.
+        let mut depth = DB::TransactionManager::get_transaction_depth(&self.connection);
+
+        while depth >= self.depth {
             // starts a rollback operation
 
             // what this does depends on the database but generally this means we queue a rollback
@@ -275,8 +291,52 @@ where
             // connection (including if the connection is returned to a pool)
 
             DB::TransactionManager::start_rollback(&mut self.connection);
+
+            let new_depth = DB::TransactionManager::get_transaction_depth(&self.connection);
+
+            if new_depth >= depth {
+                // The transaction manager doesn't track the depth; don't loop forever.
+                break;
+            }
+
+            depth = new_depth;
         }
     }
+}
+
+/// Check that a request which begins or ends a transaction changed the transaction depth
+/// of the connection from `before` to `after` as expected.
+///
+/// Middleware could return a response without passing a request on to the database, which leaves
+/// the transaction state unchanged; this turns that into an error.
+#[doc(hidden)]
+pub fn check_transaction_depth(
+    kind: RequestKind,
+    before: usize,
+    after: usize,
+) -> Result<(), Error> {
+    let expected = match kind {
+        RequestKind::Begin => before + 1,
+        RequestKind::Commit | RequestKind::Rollback => before.saturating_sub(1),
+        _ => return Ok(()),
+    };
+
+    if after == expected {
+        return Ok(());
+    }
+
+    if kind == RequestKind::Begin {
+        return Err(Error::BeginFailed);
+    }
+
+    Err(Error::Middleware(
+        format!(
+            "{} request did not end the transaction (depth {before} -> {after}); \
+             it may not have been passed on to the database",
+            kind.as_str()
+        )
+        .into(),
+    ))
 }
 
 pub fn begin_ansi_transaction_sql(depth: usize) -> SqlStr {

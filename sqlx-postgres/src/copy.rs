@@ -262,7 +262,10 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     ///
     /// The server is expected to respond with an error, so only _unexpected_ errors are returned.
     pub async fn abort(mut self, msg: impl Into<String>) -> Result<()> {
-        self.conn
+        // Keep the connection until the `COPY` is finished. (Locals are dropped in reverse order,
+        // so the lock guard below is released first.)
+        let _conn = self
+            .conn
             .take()
             .expect("PgCopyIn::fail_with: conn taken illegally");
 
@@ -296,7 +299,10 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     ///
     /// The number of rows affected is returned.
     pub async fn finish(mut self) -> Result<u64> {
-        self.conn
+        // Keep the connection until the `COPY` is finished. (Locals are dropped in reverse order,
+        // so the lock guard below is released first.)
+        let _conn = self
+            .conn
             .take()
             .expect("CopyWriter::finish: conn taken illegally");
 

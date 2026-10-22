@@ -1,6 +1,6 @@
 use sqlx_core::executor::Executor;
-use sqlx_core::middleware::Request;
-use sqlx_core::transaction::TransactionManager;
+use sqlx_core::middleware::{Request, RequestKind};
+use sqlx_core::transaction::{check_transaction_depth, TransactionManager};
 use sqlx_core::{error::Error, sql_str::SqlStr};
 
 use crate::{Sqlite, SqliteConnection};
@@ -12,9 +12,13 @@ impl TransactionManager for SqliteTransactionManager {
     type Database = Sqlite;
 
     async fn begin(conn: &mut SqliteConnection, statement: Option<SqlStr>) -> Result<(), Error> {
-        let request = Request::begin(conn.worker.shared.get_transaction_depth(), statement)?;
-        conn.dispatch(request).await?;
-        Ok(())
+        let depth = conn.worker.shared.get_transaction_depth();
+        conn.dispatch(Request::begin(depth, statement)?).await?;
+        check_transaction_depth(
+            RequestKind::Begin,
+            depth,
+            conn.worker.shared.get_transaction_depth(),
+        )
     }
 
     async fn commit(conn: &mut SqliteConnection) -> Result<(), Error> {
@@ -22,6 +26,11 @@ impl TransactionManager for SqliteTransactionManager {
 
         if depth > 0 {
             conn.dispatch(Request::commit(depth)).await?;
+            check_transaction_depth(
+                RequestKind::Commit,
+                depth,
+                conn.worker.shared.get_transaction_depth(),
+            )?;
         }
 
         Ok(())
@@ -32,6 +41,11 @@ impl TransactionManager for SqliteTransactionManager {
 
         if depth > 0 {
             conn.dispatch(Request::rollback(depth)).await?;
+            check_transaction_depth(
+                RequestKind::Rollback,
+                depth,
+                conn.worker.shared.get_transaction_depth(),
+            )?;
         }
 
         Ok(())

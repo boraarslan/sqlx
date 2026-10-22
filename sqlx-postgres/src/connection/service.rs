@@ -118,23 +118,35 @@ async fn begin(
     state: &PgConnectionState,
     statement: SqlStr,
 ) -> Result<(), Error> {
-    let depth = state.transaction_depth();
+    // Receive the responses to statements sent earlier (like queued rollbacks) first, so that an
+    // error below is the response to this statement.
+    conn.wait_until_ready().await?;
 
     let rollback = Rollback::new(conn, state);
     rollback.conn.queue_simple_query(statement.as_str())?;
-    // Claim the depth before the round trip, not after. `start_rollback` -- which both
-    // this guard and `Transaction`'s own drop guard call -- is a no-op while the depth is
-    // zero, so a future cancelled during the await below would otherwise leave the server
-    // in a transaction with nothing queued to end it. `Pool` then hands that connection
-    // to the next borrower, whose statements silently run inside it. Unwound just below
-    // if the BEGIN did not take.
-    state.set_transaction_depth(depth + 1);
-    rollback.conn.wait_until_ready().await?;
-    if !rollback.conn.in_transaction() {
-        state.set_transaction_depth(depth);
+    // Claim the depth before the round trip, not after. `start_rollback` -- which this guard
+    // calls -- is a no-op while the depth is zero, so a future cancelled during the await below
+    // would otherwise leave the server in a transaction with nothing queued to end it. `Pool`
+    // then hands that connection to the next borrower, whose statements silently run inside
+    // it. Unwound just below if the BEGIN did not take.
+    state.increment_transaction_depth();
+
+    let in_transaction = match rollback.conn.wait_until_ready().await {
+        Ok(()) => rollback.conn.in_transaction(),
+        Err(e) => {
+            // The statement failed, so there is no transaction or savepoint to roll back.
+            rollback.defuse();
+            state.decrement_transaction_depth();
+            return Err(e);
+        }
+    };
+
+    rollback.defuse();
+
+    if !in_transaction {
+        state.decrement_transaction_depth();
         return Err(Error::BeginFailed);
     }
-    rollback.defuse();
 
     Ok(())
 }
@@ -145,13 +157,11 @@ async fn end_transaction(
     state: &PgConnectionState,
     statement: SqlStr,
 ) -> Result<(), Error> {
-    let depth = state.transaction_depth();
-
-    if depth > 0 {
+    if state.transaction_depth() > 0 {
         let mut stream = pin!(PgConn::run(&mut *conn, statement, None, false, None).await?);
         while stream.try_next().await?.is_some() {}
 
-        state.set_transaction_depth(depth - 1);
+        state.decrement_transaction_depth();
     }
 
     Ok(())

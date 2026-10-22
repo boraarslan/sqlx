@@ -398,10 +398,42 @@ pub struct ConnectionService<DB: Database, D> {
 
 enum Stack<DB: Database, D> {
     Driver(D),
-    Layered(BoxService<DB>),
+    Layered {
+        service: BoxService<DB>,
+        // Used to rebuild the stack; see `Dispatch`.
+        driver: D,
+        layers: Layers<BoxService<DB>>,
+    },
 }
 
-impl<DB, D> ConnectionService<DB, D>
+impl<DB: Database, D: Clone + DriverService<DB>> Stack<DB, D> {
+    /// Replace the middleware services with new instances.
+    fn rebuild(&mut self) {
+        if let Stack::Layered {
+            service,
+            driver,
+            layers,
+        } = self
+        {
+            *service = layers.apply(BoxService::new(driver.clone()));
+        }
+    }
+}
+
+/// The bounds of the driver service of a [`ConnectionService`].
+#[doc(hidden)]
+pub trait DriverService<DB: Database>:
+    Service<
+        Request<DB>,
+        Response = Response<DB>,
+        Error = Error,
+        Future = BoxFuture<'static, Result<Response<DB>, Error>>,
+    > + Send
+    + 'static
+{
+}
+
+impl<DB, D> DriverService<DB> for D
 where
     DB: Database,
     D: Service<
@@ -412,18 +444,31 @@ where
         > + Send
         + 'static,
 {
+}
+
+impl<DB, D> ConnectionService<DB, D>
+where
+    DB: Database,
+    D: DriverService<DB> + Clone,
+{
     /// Wrap the driver service in `layers`.
     pub fn new(driver: D, layers: &Layers<BoxService<DB>>, info: Arc<ConnectionInfo>) -> Self {
         let stack = if layers.is_empty() {
             Stack::Driver(driver)
         } else {
-            Stack::Layered(layers.apply(BoxService::new(driver)))
+            Stack::Layered {
+                service: layers.apply(BoxService::new(driver.clone())),
+                driver,
+                layers: layers.clone(),
+            }
         };
 
         Self { stack, info }
     }
 
     /// Wait until the stack is ready, then send it `request`.
+    ///
+    /// With layers, the request is sent to the stack when the returned future is first polled.
     pub fn dispatch(
         &mut self,
         mut request: Request<DB>,
@@ -431,12 +476,27 @@ where
     ) -> BoxFuture<'_, Result<Response<DB>, Error>> {
         match &mut self.stack {
             // The driver service doesn't read the connection info or transaction depth.
-            Stack::Driver(driver) => ready_and_call(driver, request),
-            Stack::Layered(service) => {
+            // It's practically always ready, which lets us skip an allocation.
+            Stack::Driver(driver) => {
+                match driver.poll_ready(&mut Context::from_waker(Waker::noop())) {
+                    Poll::Ready(Ok(())) => driver.call(request),
+                    Poll::Ready(Err(e)) => Box::pin(future::ready(Err(e))),
+                    Poll::Pending => Box::pin(async move {
+                        poll_fn(|cx| driver.poll_ready(cx)).await?;
+                        driver.call(request).await
+                    }),
+                }
+            }
+            stack @ Stack::Layered { .. } => {
                 request.set_connection_info(self.info.clone());
                 request.set_transaction_depth(transaction_depth);
 
-                ready_and_call(service, request)
+                Box::pin(Dispatch {
+                    stack,
+                    request: Some(request),
+                    waiting: false,
+                    response: None,
+                })
             }
         }
     }
@@ -446,7 +506,7 @@ where
     pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         match &mut self.stack {
             Stack::Driver(driver) => driver.poll_ready(cx),
-            Stack::Layered(service) => service.poll_ready(cx),
+            Stack::Layered { service, .. } => service.poll_ready(cx),
         }
     }
 
@@ -465,7 +525,7 @@ where
 
         match &mut self.stack {
             Stack::Driver(driver) => driver.call(request),
-            Stack::Layered(service) => service.call(request),
+            Stack::Layered { service, .. } => service.call(request),
         }
     }
 
@@ -476,42 +536,72 @@ where
 
     /// Returns `true` if any layers were configured.
     pub fn is_layered(&self) -> bool {
-        matches!(self.stack, Stack::Layered(_))
+        matches!(self.stack, Stack::Layered { .. })
     }
 }
 
-/// Call `service` right away if it's ready, which avoids an allocation; otherwise, return a
-/// future which waits until it is.
+/// Waits until a layered stack is ready, then sends it the request.
 ///
-/// Services are usually ready immediately: drivers always are, and a [`BoxService`] is unless
-/// a clone of it is in use.
-fn ready_and_call<DB, S>(
-    service: &mut S,
-    request: Request<DB>,
-) -> BoxFuture<'_, Result<Response<DB>, Error>>
-where
-    DB: Database,
-    S: Service<
-            Request<DB>,
-            Response = Response<DB>,
-            Error = Error,
-            Future = BoxFuture<'static, Result<Response<DB>, Error>>,
-        > + Send,
-{
-    match service.poll_ready(&mut Context::from_waker(Waker::noop())) {
-        Poll::Ready(Ok(())) => service.call(request),
-        Poll::Ready(Err(e)) => Box::pin(future::ready(Err(e))),
-        Poll::Pending => Box::pin(async move {
-            poll_fn(|cx| service.poll_ready(cx)).await?;
-            service.call(request).await
-        }),
+/// If this future is dropped while waiting, or after the stack returned an error from
+/// `poll_ready()`, the stack is rebuilt: a service may hold resources it reserved in `poll_ready()`
+/// (like a permit of a concurrency limit shared with other connections) until it's called or
+/// dropped, and the connection may sit unused in a pool for a long time.
+struct Dispatch<'a, DB: Database, D: Clone + DriverService<DB>> {
+    stack: &'a mut Stack<DB, D>,
+    request: Option<Request<DB>>,
+    // `poll_ready()` was called, but the request was not sent yet.
+    waiting: bool,
+    response: Option<BoxFuture<'static, Result<Response<DB>, Error>>>,
+}
+
+// We never pin-project into the fields.
+impl<DB: Database, D: Clone + DriverService<DB>> Unpin for Dispatch<'_, DB, D> {}
+
+impl<DB: Database, D: Clone + DriverService<DB>> Future for Dispatch<'_, DB, D> {
+    type Output = Result<Response<DB>, Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+
+        if let Some(response) = &mut this.response {
+            return response.as_mut().poll(cx);
+        }
+
+        let Stack::Layered { service, .. } = &mut *this.stack else {
+            unreachable!("BUG: `Dispatch` used without layers");
+        };
+
+        this.waiting = true;
+
+        // If this returns an error, `waiting` stays set, so the stack is rebuilt on drop.
+        ready!(service.poll_ready(cx))?;
+
+        this.waiting = false;
+
+        let request = this
+            .request
+            .take()
+            .expect("BUG: `Dispatch` polled after completion");
+
+        this.response
+            .insert(service.call(request))
+            .as_mut()
+            .poll(cx)
+    }
+}
+
+impl<DB: Database, D: Clone + DriverService<DB>> Drop for Dispatch<'_, DB, D> {
+    fn drop(&mut self) {
+        if self.waiting {
+            self.stack.rebuild();
+        }
     }
 }
 
 impl<DB: Database, D> Debug for ConnectionService<DB, D> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectionService")
-            .field("layered", &matches!(self.stack, Stack::Layered(_)))
+            .field("layered", &matches!(self.stack, Stack::Layered { .. }))
             .field("info", &self.info)
             .finish_non_exhaustive()
     }

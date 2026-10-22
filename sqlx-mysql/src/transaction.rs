@@ -1,4 +1,4 @@
-use sqlx_core::middleware::Request;
+use sqlx_core::middleware::{Request, RequestKind};
 use sqlx_core::sql_str::SqlStr;
 
 use crate::error::Error;
@@ -14,9 +14,9 @@ impl TransactionManager for MySqlTransactionManager {
     type Database = MySql;
 
     async fn begin(conn: &mut MySqlConnection, statement: Option<SqlStr>) -> Result<(), Error> {
-        let request = Request::begin(conn.transaction_depth(), statement)?;
-        conn.dispatch(request).await?;
-        Ok(())
+        let depth = conn.transaction_depth();
+        conn.dispatch(Request::begin(depth, statement)?).await?;
+        check_transaction_depth(RequestKind::Begin, depth, conn.transaction_depth())
     }
 
     async fn commit(conn: &mut MySqlConnection) -> Result<(), Error> {
@@ -24,6 +24,7 @@ impl TransactionManager for MySqlTransactionManager {
 
         if depth > 0 {
             conn.dispatch(Request::commit(depth)).await?;
+            check_transaction_depth(RequestKind::Commit, depth, conn.transaction_depth())?;
         }
 
         Ok(())
@@ -34,6 +35,7 @@ impl TransactionManager for MySqlTransactionManager {
 
         if depth > 0 {
             conn.dispatch(Request::rollback(depth)).await?;
+            check_transaction_depth(RequestKind::Rollback, depth, conn.transaction_depth())?;
         }
 
         Ok(())

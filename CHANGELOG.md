@@ -33,11 +33,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * `Request::connection_info()` describes the database a request is sent to (from the new
     `ConnectOptions::connection_info()`), and `Request::transaction_depth()` the transaction state of the connection.
 
+### Fixed
+* Dropping a `Transaction` whose `begin()` failed (e.g. a savepoint that could not be created) no longer rolls back
+  its parent transaction. A `Transaction` now only rolls back on drop if the connection is still at its depth.
+* A cancelled `BEGIN` on MySQL no longer leaves the connection in a transaction that is never ended (the transaction
+  depth is now claimed before the round trip, as on Postgres).
+* `Pool` closes connections which are in a transaction when they are returned to the pool or before they are handed
+  out, instead of letting the next user's statements run inside a transaction nothing will end.
+
 ### Breaking
 * All methods of `Executor` are now implemented in terms of the new `Executor::dispatch()`. Existing implementations
   (which implement `fetch_many()`, `fetch_optional()`, `prepare_with()` and `describe()`) keep working, as `dispatch()`
   has a default implementation that returns an error, but they should implement `dispatch()` instead, which is
-  required to use them with middleware APIs like `ServiceExecutor`.
+  required to use them with middleware APIs like `ServiceExecutor` and with pools that have `PoolOptions::layer()`s.
+* `TransactionManager` implementations check that `BEGIN`, `COMMIT` and `ROLLBACK` requests changed the transaction
+  depth, so middleware which answers them without passing them on causes an error.
 * `ConnectOptions` has the new required methods `layers()`, `layers_mut()`, `connect_layers()` and
   `connect_layers_mut()`.
 * `AnyConnectionBackend` replaces `fetch_many()`, `fetch_optional()`, `prepare_with()`, `describe()`, `begin()`,

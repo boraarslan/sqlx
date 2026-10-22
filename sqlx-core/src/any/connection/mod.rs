@@ -162,6 +162,10 @@ impl Connection for AnyConnection {
 
 /// Sends requests through the middleware stack of this connection.
 ///
+/// The stream of a response keeps the connection busy until it's exhausted or dropped, even
+/// though it doesn't borrow the connection: drop it before sending another request on the same
+/// task, or that request waits forever.
+///
 /// See the [`middleware`][crate::middleware] module for details.
 impl Service<Request<Any>> for AnyConnection {
     type Response = Response<Any>;

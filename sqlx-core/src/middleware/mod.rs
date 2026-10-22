@@ -89,12 +89,33 @@
 //! Middleware that needs to observe the whole execution of a query, such as tracing,
 //! should wrap the stream with [`Response::map_stream()`], like [`trace::TraceLayer`] does.
 //!
+//! The stream of a response keeps the connection busy, even though it doesn't borrow it: when
+//! using a connection as a `Service` directly, drop the stream of a response before sending
+//! the next request on the same task, or that request waits forever.
+//!
 //! ## Cancellation
 //! Dropping a response future or stream before it completes does not cancel the statement on
 //! the server: the connection discards the rest of the response before executing the next
 //! request. In particular, a timeout does not stop a long-running query; the next request
 //! on the connection waits for the query to finish. Consider setting a statement timeout on the
 //! server (e.g. `statement_timeout` in Postgres) as well.
+//!
+//! If a request is dropped while waiting for the middleware stack of a connection to be ready,
+//! the stack is rebuilt (losing the state of its services), as a service may hold resources it
+//! reserved while getting ready (like a permit of a concurrency limit shared with other
+//! connections) until it's called or dropped.
+//!
+//! ## Transactions
+//! `BEGIN`, `COMMIT` and `ROLLBACK` requests update the transaction state of the connection
+//! when the driver completes them. Middleware must not keep them running after their response
+//! future is dropped (e.g. by spawning them): a `BEGIN` that completes after its
+//! [`Transaction`] was dropped leaves the connection in a transaction that nothing ends.
+//! (A [`Pool`] closes connections returned to it in this state.)
+//!
+//! Retrying requests inside a transaction is rarely correct, as the failure likely aborted
+//! the transaction; see [`Request::in_transaction()`]. In particular, a `COMMIT` that failed
+//! (e.g. with a serialization failure) may have ended the transaction: retrying it can then
+//! report success for a transaction that was rolled back.
 //!
 //! # Connecting
 //! Each attempt to open a connection, including those made by a [`Pool`], is sent through the
@@ -152,12 +173,12 @@
 //!   `tower::retry::Retry`) can be used anywhere.
 //! * A layer added with `ConnectOptions::layer()` is applied to each connection separately, so
 //!   `tower::limit::ConcurrencyLimitLayer` limits concurrency per connection (which is always 1).
-//!   Use `tower::limit::GlobalConcurrencyLimitLayer`, or add the layer to the pool, to limit
-//!   concurrency across connections.
+//!   Add the layer to the pool to limit concurrency across connections (or use
+//!   `tower::limit::GlobalConcurrencyLimitLayer`, which doesn't limit queries waiting for a
+//!   connection).
 //! * Some middleware in the `tower` crate (e.g. `timeout`, `limit::rate` and `buffer`) requires
 //!   a Tokio runtime and panics otherwise.
-//! * Retrying requests inside a transaction is rarely correct, as the failure likely aborted
-//!   the transaction; see [`Request::in_transaction()`].
+//! * Retrying requests inside a transaction is rarely correct; see [Transactions](#transactions).
 //!
 //! # What Doesn't Pass Through Middleware
 //! * The statements used to initialize connections (e.g. MySQL's `SET` statement and SQLite's

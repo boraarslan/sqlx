@@ -237,6 +237,10 @@ impl SqliteConnection {
 
 /// Sends requests through the middleware stack of this connection.
 ///
+/// The stream of a response keeps the connection busy until it's exhausted or dropped, even
+/// though it doesn't borrow the connection: drop it before sending another request on the same
+/// task, or that request waits forever.
+///
 /// See the [`middleware`][sqlx_core::middleware] module for details.
 impl Service<Request<Sqlite>> for SqliteConnection {
     type Response = Response<Sqlite>;

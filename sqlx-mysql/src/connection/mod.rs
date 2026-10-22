@@ -155,8 +155,17 @@ impl MySqlConnectionState {
         self.transaction_depth.load(Ordering::Acquire)
     }
 
-    pub(crate) fn set_transaction_depth(&self, depth: usize) {
-        self.transaction_depth.store(depth, Ordering::Release);
+    pub(crate) fn increment_transaction_depth(&self) {
+        self.transaction_depth.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Decrement the transaction depth if it's not zero, returning the previous depth.
+    pub(crate) fn decrement_transaction_depth(&self) -> Option<usize> {
+        self.transaction_depth
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+                depth.checked_sub(1)
+            })
+            .ok()
     }
 
     /// Queue a `ROLLBACK` of the current transaction or savepoint, if any,
@@ -164,11 +173,9 @@ impl MySqlConnectionState {
     ///
     /// `conn` should be `None` if the connection is locked elsewhere.
     pub(crate) fn start_rollback(&self, conn: Option<&mut MySqlConn>) {
-        let depth = self.transaction_depth();
-
-        if depth == 0 {
+        let Some(depth) = self.decrement_transaction_depth() else {
             return;
-        }
+        };
 
         let statement = rollback_ansi_transaction_sql(depth);
 
@@ -176,8 +183,6 @@ impl MySqlConnectionState {
             Some(conn) => conn.queue_simple_query(statement.as_str()),
             None => self.pending_rollbacks.push(statement),
         }
-
-        self.set_transaction_depth(depth - 1);
     }
 
     pub(crate) fn queue_pending_queries(&self, conn: &mut MySqlConn) {
@@ -218,6 +223,10 @@ impl Debug for MySqlConn {
 }
 
 /// Sends requests through the middleware stack of this connection.
+///
+/// The stream of a response keeps the connection busy until it's exhausted or dropped, even
+/// though it doesn't borrow the connection: drop it before sending another request on the same
+/// task, or that request waits forever.
 ///
 /// See the [`middleware`][sqlx_core::middleware] module for details.
 impl Service<Request<MySql>> for MySqlConnection {

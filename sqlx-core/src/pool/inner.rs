@@ -5,6 +5,7 @@ use crate::database::Database;
 use crate::error::Error;
 use crate::middleware::{BoxService, ConnectionInfo};
 use crate::pool::{deadline_as_timeout, CloseEvent, Pool, PoolOptions};
+use crate::transaction::TransactionManager;
 use crossbeam_queue::ArrayQueue;
 
 use crate::sync::{AsyncSemaphore, AsyncSemaphoreReleaser};
@@ -508,6 +509,13 @@ async fn check_idle_conn<DB: Database>(
             // connection is broken so don't try to close nicely
             return Err(conn.close_hard().await);
         }
+    }
+
+    if DB::TransactionManager::get_transaction_depth(&conn.live.raw) > 0 {
+        // A transaction was started after the connection was returned to the pool, e.g. by
+        // middleware which kept a `BEGIN` going after the `Transaction` which sent it was dropped.
+        tracing::warn!("closing an idle connection which is in a transaction");
+        return Err(conn.close().await);
     }
 
     if let Some(test) = &options.before_acquire {

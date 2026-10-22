@@ -198,8 +198,17 @@ impl PgConnectionState {
         self.transaction_depth.load(Ordering::Acquire)
     }
 
-    pub(crate) fn set_transaction_depth(&self, depth: usize) {
-        self.transaction_depth.store(depth, Ordering::Release);
+    pub(crate) fn increment_transaction_depth(&self) {
+        self.transaction_depth.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Decrement the transaction depth if it's not zero, returning the previous depth.
+    pub(crate) fn decrement_transaction_depth(&self) -> Option<usize> {
+        self.transaction_depth
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+                depth.checked_sub(1)
+            })
+            .ok()
     }
 
     /// Queue a `ROLLBACK` of the current transaction or savepoint, if any,
@@ -207,14 +216,9 @@ impl PgConnectionState {
     ///
     /// `conn` should be `None` if the connection is locked elsewhere.
     pub(crate) fn start_rollback(&self, conn: Option<&mut PgConn>) {
-        let depth = self.transaction_depth();
-
-        if depth == 0 {
-            return;
+        if let Some(depth) = self.decrement_transaction_depth() {
+            self.queue_simple_query(conn, rollback_ansi_transaction_sql(depth));
         }
-
-        self.queue_simple_query(conn, rollback_ansi_transaction_sql(depth));
-        self.set_transaction_depth(depth - 1);
     }
 
     /// Queue a simple query on `conn`, or on the connection the next time it's locked if `None`.
@@ -332,6 +336,10 @@ impl Debug for PgConn {
 }
 
 /// Sends requests through the middleware stack of this connection.
+///
+/// The stream of a response keeps the connection busy until it's exhausted or dropped, even
+/// though it doesn't borrow the connection: drop it before sending another request on the same
+/// task, or that request waits forever.
 ///
 /// See the [`middleware`][sqlx_core::middleware] module for details.
 impl Service<Request<Postgres>> for PgConnection {

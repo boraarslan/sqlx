@@ -1135,3 +1135,204 @@ async fn it_traces_with_legacy_attributes() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[sqlx_macros::test]
+async fn it_keeps_the_parent_transaction_when_middleware_fails_a_savepoint_commit(
+) -> anyhow::Result<()> {
+    // Fails savepoint commits after the database released the savepoint.
+    let layer = middleware::from_fn(
+        |request: Request<Postgres>, next: Next<Postgres>| async move {
+            let fail = request.kind() == RequestKind::Commit && request.transaction_depth() == 2;
+            let response = next.run(request).await?;
+
+            if fail {
+                return Err(Error::Protocol("simulated failure".into()));
+            }
+
+            Ok(response)
+        },
+    );
+
+    let mut conn = PgConnection::connect_with(&connect_options()?.layer(layer)).await?;
+    conn.execute("CREATE TEMPORARY TABLE middleware_savepoint (id INT)")
+        .await?;
+
+    let mut tx = conn.begin().await?;
+    tx.execute("INSERT INTO middleware_savepoint VALUES (1)")
+        .await?;
+
+    let mut savepoint = tx.begin().await?;
+    savepoint
+        .execute("INSERT INTO middleware_savepoint VALUES (2)")
+        .await?;
+    savepoint.commit().await.unwrap_err();
+
+    // Dropping the savepoint must not roll back the parent transaction.
+    tx.execute("INSERT INTO middleware_savepoint VALUES (3)")
+        .await?;
+    assert!(tx.is_in_transaction());
+    tx.commit().await?;
+
+    let ids: Vec<i32> = sqlx::query_scalar("SELECT id FROM middleware_savepoint ORDER BY id")
+        .fetch_all(&mut conn)
+        .await?;
+    assert_eq!(ids, [1, 2, 3]);
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_keeps_the_parent_transaction_when_a_savepoint_cannot_begin() -> anyhow::Result<()> {
+    // Rejects savepoints.
+    let layer = middleware::from_fn(|request: Request<Postgres>, next: Next<Postgres>| {
+        let reject = request.kind() == RequestKind::Begin && request.transaction_depth() > 0;
+
+        async move {
+            if reject {
+                return Err(Error::Protocol("no savepoints".into()));
+            }
+
+            next.run(request).await
+        }
+    });
+
+    let mut conn = PgConnection::connect_with(&connect_options()?.layer(layer)).await?;
+    conn.execute("CREATE TEMPORARY TABLE middleware_savepoint (id INT)")
+        .await?;
+
+    let mut tx = conn.begin().await?;
+    tx.execute("INSERT INTO middleware_savepoint VALUES (1)")
+        .await?;
+    tx.begin().await.unwrap_err();
+    tx.execute("INSERT INTO middleware_savepoint VALUES (2)")
+        .await?;
+    tx.commit().await?;
+
+    let ids: Vec<i32> = sqlx::query_scalar("SELECT id FROM middleware_savepoint ORDER BY id")
+        .fetch_all(&mut conn)
+        .await?;
+    assert_eq!(ids, [1, 2]);
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_detects_transaction_requests_which_did_not_reach_the_database() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Answers transaction control requests without passing them on, while enabled.
+    let short_circuit = Arc::new(AtomicBool::new(true));
+    let layer = middleware::from_fn({
+        let short_circuit = short_circuit.clone();
+        move |request: Request<Postgres>, next: Next<Postgres>| {
+            let skip =
+                request.kind().is_transaction_control() && short_circuit.load(Ordering::SeqCst);
+
+            async move {
+                if skip {
+                    return Ok(Response::Done);
+                }
+
+                next.run(request).await
+            }
+        }
+    });
+
+    let mut conn = PgConnection::connect_with(&connect_options()?.layer(layer)).await?;
+    conn.execute("CREATE TEMPORARY TABLE middleware_short_circuit (id INT)")
+        .await?;
+
+    let err = conn.begin().await.unwrap_err();
+    assert!(matches!(err, Error::BeginFailed), "{err:?}");
+    assert!(!conn.is_in_transaction());
+
+    short_circuit.store(false, Ordering::SeqCst);
+    let mut tx = conn.begin().await?;
+    tx.execute("INSERT INTO middleware_short_circuit VALUES (1)")
+        .await?;
+
+    short_circuit.store(true, Ordering::SeqCst);
+    let err = tx.commit().await.unwrap_err();
+    assert!(matches!(err, Error::Middleware(_)), "{err:?}");
+
+    // The transaction was rolled back when it was dropped.
+    short_circuit.store(false, Ordering::SeqCst);
+    assert!(!conn.is_in_transaction());
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM middleware_short_circuit")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(count, 0);
+
+    Ok(())
+}
+
+#[cfg(feature = "_rt-tokio")]
+#[sqlx_macros::test]
+async fn it_rebuilds_the_stack_when_a_request_is_cancelled_while_waiting() -> anyhow::Result<()> {
+    use tower::limit::GlobalConcurrencyLimitLayer;
+
+    // One query at a time across both connections.
+    let limit = GlobalConcurrencyLimitLayer::new(1);
+    let options = connect_options()?.layer(limit);
+
+    let mut a = PgConnection::connect_with(&options).await?;
+    let mut b = PgConnection::connect_with(&options).await?;
+
+    let slow = tokio::spawn(async move {
+        a.execute("SELECT pg_sleep(0.3)").await?;
+        anyhow::Ok(a)
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Gives up while waiting for the permit, which `a` holds.
+    tokio::time::timeout(Duration::from_millis(50), b.execute("SELECT 1"))
+        .await
+        .unwrap_err();
+
+    // Had `b` kept waiting for a permit, it would get the one `a` releases, and keep it.
+    let mut a = slow.await??;
+    tokio::time::timeout(Duration::from_secs(5), a.execute("SELECT 2")).await??;
+    tokio::time::timeout(Duration::from_secs(5), b.execute("SELECT 3")).await??;
+
+    Ok(())
+}
+
+#[cfg(feature = "_rt-tokio")]
+#[sqlx_macros::test]
+async fn it_closes_pooled_connections_left_in_a_transaction() -> anyhow::Result<()> {
+    // Starts transactions in the background, and doesn't wait for them.
+    let layer = middleware::from_fn(
+        |request: Request<Postgres>, next: Next<Postgres>| async move {
+            if request.kind() == RequestKind::Begin {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let _ = next.run(request).await;
+                });
+
+                return Err(Error::Protocol("detached".into()));
+            }
+
+            next.run(request).await
+        },
+    );
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(connect_options()?.layer(layer))
+        .await?;
+
+    pool.begin().await.unwrap_err();
+
+    // The `BEGIN` runs on the idle connection.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut conn = pool.acquire().await?;
+    assert!(!conn.is_in_transaction());
+
+    // `SAVEPOINT` fails outside of a transaction.
+    let err = conn.execute("SAVEPOINT probe").await.unwrap_err();
+    let code = err.as_database_error().and_then(|e| e.code());
+    assert_eq!(code.as_deref(), Some("25P01"), "{err:?}");
+
+    Ok(())
+}

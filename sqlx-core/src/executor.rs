@@ -78,6 +78,9 @@ pub trait Executor<'c>: Send + Debug + Sized {
     /// [`fetch_many()`][Self::fetch_many], [`fetch_optional()`][Self::fetch_optional],
     /// [`prepare_with()`][Self::prepare_with] and `describe()`; they cannot be used with
     /// [`ServiceExecutor`][crate::middleware::ServiceExecutor] or other APIs that call `dispatch()`.
+    /// In particular, a [`Pool`][crate::pool::Pool] of connections whose `Executor` doesn't
+    /// implement `dispatch()` only works if no [pool middleware][crate::pool::PoolOptions::layer]
+    /// is configured.
     fn dispatch<'e>(
         self,
         request: Request<Self::Database>,
@@ -158,15 +161,7 @@ pub trait Executor<'c>: Send + Debug + Sized {
         'c: 'e,
         E: 'q + Execute<'q, Self::Database>,
     {
-        let request = match Request::from_execute(query, RequestKind::Fetch) {
-            Ok(request) => request,
-            Err(e) => return stream::once(future::ready(Err(e))).boxed(),
-        };
-
-        self.dispatch(request)
-            .and_then(|response| future::ready(response.into_stream()))
-            .try_flatten_stream()
-            .boxed()
+        provided::fetch_many(self, query)
     }
 
     /// Execute the query and return all the generated results, collected into a [`Vec`].
@@ -212,29 +207,7 @@ pub trait Executor<'c>: Send + Debug + Sized {
         'c: 'e,
         E: 'q + Execute<'q, Self::Database>,
     {
-        let request = Request::from_execute(query, RequestKind::FetchOptional);
-
-        let response = match request {
-            Ok(request) => self.dispatch(request),
-            Err(e) => return future::ready(Err(e)).boxed(),
-        };
-
-        Box::pin(async move {
-            let mut stream = response.await?.into_stream()?;
-            let mut first = None;
-
-            // Read the whole stream so that errors (e.g. deferred constraint violations)
-            // are not silently dropped; drivers may end the stream early for `FetchOptional`.
-            while let Some(item) = stream.try_next().await? {
-                if let Either::Right(row) = item {
-                    if first.is_none() {
-                        first = Some(row);
-                    }
-                }
-            }
-
-            Ok(first)
-        })
+        provided::fetch_optional(self, query)
     }
 
     /// Prepare the SQL query to inspect the type information of its parameters
@@ -269,9 +242,7 @@ pub trait Executor<'c>: Send + Debug + Sized {
     where
         'c: 'e,
     {
-        self.dispatch(Request::prepare(sql, parameters.to_vec()))
-            .and_then(|response| future::ready(response.into_statement()))
-            .boxed()
+        provided::prepare_with(self, sql, parameters)
     }
 
     /// Describe the SQL query and return type information about its parameters
@@ -288,7 +259,102 @@ pub trait Executor<'c>: Send + Debug + Sized {
     where
         'c: 'e,
     {
-        self.dispatch(Request::new(RequestKind::Describe, sql))
+        provided::describe(self, sql)
+    }
+}
+
+/// The provided implementations of the methods of [`Executor`] which send requests with
+/// [`Executor::dispatch()`].
+pub(crate) mod provided {
+    use super::*;
+
+    pub(crate) fn fetch_many<'c, 'e, 'q, X, E>(
+        executor: X,
+        query: E,
+    ) -> BoxStream<
+        'e,
+        Result<
+            Either<<X::Database as Database>::QueryResult, <X::Database as Database>::Row>,
+            Error,
+        >,
+    >
+    where
+        X: Executor<'c>,
+        'c: 'e,
+        'q: 'e,
+        E: 'q + Execute<'q, X::Database>,
+    {
+        let request = match Request::from_execute(query, RequestKind::Fetch) {
+            Ok(request) => request,
+            Err(e) => return stream::once(future::ready(Err(e))).boxed(),
+        };
+
+        executor
+            .dispatch(request)
+            .and_then(|response| future::ready(response.into_stream()))
+            .try_flatten_stream()
+            .boxed()
+    }
+
+    pub(crate) fn fetch_optional<'c, 'e, 'q, X, E>(
+        executor: X,
+        query: E,
+    ) -> BoxFuture<'e, Result<Option<<X::Database as Database>::Row>, Error>>
+    where
+        X: Executor<'c>,
+        'c: 'e,
+        'q: 'e,
+        E: 'q + Execute<'q, X::Database>,
+    {
+        let response = match Request::from_execute(query, RequestKind::FetchOptional) {
+            Ok(request) => executor.dispatch(request),
+            Err(e) => return future::ready(Err(e)).boxed(),
+        };
+
+        Box::pin(async move {
+            let mut stream = response.await?.into_stream()?;
+            let mut first = None;
+
+            // Read the whole stream so that errors (e.g. deferred constraint violations)
+            // are not silently dropped; drivers may end the stream early for `FetchOptional`.
+            while let Some(item) = stream.try_next().await? {
+                if let Either::Right(row) = item {
+                    if first.is_none() {
+                        first = Some(row);
+                    }
+                }
+            }
+
+            Ok(first)
+        })
+    }
+
+    pub(crate) fn prepare_with<'c, 'e, X>(
+        executor: X,
+        sql: SqlStr,
+        parameters: &'e [<X::Database as Database>::TypeInfo],
+    ) -> BoxFuture<'e, Result<<X::Database as Database>::Statement, Error>>
+    where
+        X: Executor<'c>,
+        'c: 'e,
+    {
+        executor
+            .dispatch(Request::prepare(sql, parameters.to_vec()))
+            .and_then(|response| future::ready(response.into_statement()))
+            .boxed()
+    }
+
+    #[cfg(feature = "offline")]
+    pub(crate) fn describe<'c, 'e, X>(
+        executor: X,
+        sql: SqlStr,
+    ) -> BoxFuture<'e, Result<crate::describe::Describe<X::Database>, Error>>
+    where
+        X: Executor<'c>,
+        'c: 'e,
+    {
+        executor
+            .dispatch(Request::new(RequestKind::Describe, sql))
             .and_then(|response| future::ready(response.into_describe()))
             .boxed()
     }
