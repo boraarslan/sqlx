@@ -64,7 +64,17 @@ where
         &mut self,
         request: Request<DB>,
     ) -> BoxFuture<'static, Result<Response<DB>, Error>> {
-        let fut = Service::call(self, request);
+        let mut fut = Some(Service::call(self, request));
+
+        // Avoid boxing the future again if it's already the right type,
+        // like the futures of drivers and of `BoxService` itself.
+        if let Some(fut) = (&mut fut as &mut dyn Any)
+            .downcast_mut::<Option<BoxFuture<'static, Result<Response<DB>, Error>>>>()
+        {
+            return fut.take().expect("BUG: future already taken");
+        }
+
+        let fut = fut.take().expect("BUG: future already taken");
         Box::pin(async move { fut.await.map_err(into_sqlx_error) })
     }
 }
@@ -100,14 +110,24 @@ impl<DB: Database> BoxService<DB> {
     /// Erase the type of `service`.
     ///
     /// Errors returned by the service are converted with [`into_sqlx_error()`].
+    ///
+    /// If `service` is already a `BoxService`, it's returned as-is.
     pub fn new<S>(service: S) -> Self
     where
         S: Service<Request<DB>, Response = Response<DB>> + Send + 'static,
         S::Error: Into<BoxDynError> + 'static,
         S::Future: Send + 'static,
     {
+        let mut service = Some(service);
+
+        if let Some(boxed) = (&mut service as &mut dyn Any).downcast_mut::<Option<Self>>() {
+            return boxed.take().expect("BUG: service already taken");
+        }
+
         Self {
-            shared: Arc::new(Mutex::new(Box::new(service))),
+            shared: Arc::new(Mutex::new(Box::new(
+                service.take().expect("BUG: service already taken"),
+            ))),
             state: SyncWrapper::new(State::Idle),
         }
     }
@@ -309,27 +329,12 @@ where
     ) -> BoxFuture<'_, Result<Response<DB>, Error>> {
         match &mut self.stack {
             // The driver service doesn't read the connection info or transaction depth.
-            Stack::Driver(driver) => {
-                // Driver services are usually always ready, which lets us skip the extra
-                // allocation. A type-erased driver (like that of `AnyConnection`) may still
-                // need `poll_ready()` to be called, however.
-                match driver.poll_ready(&mut Context::from_waker(Waker::noop())) {
-                    Poll::Ready(Ok(())) => driver.call(request),
-                    Poll::Ready(Err(e)) => Box::pin(future::ready(Err(e))),
-                    Poll::Pending => Box::pin(async move {
-                        poll_fn(|cx| driver.poll_ready(cx)).await?;
-                        driver.call(request).await
-                    }),
-                }
-            }
+            Stack::Driver(driver) => ready_and_call(driver, request),
             Stack::Layered(service) => {
                 request.set_connection_info(self.info.clone());
                 request.set_transaction_depth(transaction_depth);
 
-                Box::pin(async move {
-                    poll_fn(|cx| service.poll_ready(cx)).await?;
-                    service.call(request).await
-                })
+                ready_and_call(service, request)
             }
         }
     }
@@ -370,6 +375,34 @@ where
     /// Returns `true` if any layers were configured.
     pub fn is_layered(&self) -> bool {
         matches!(self.stack, Stack::Layered(_))
+    }
+}
+
+/// Call `service` right away if it's ready, which avoids an allocation; otherwise, return a
+/// future which waits until it is.
+///
+/// Services are usually ready immediately: drivers always are, and a [`BoxService`] is unless
+/// a clone of it is in use.
+fn ready_and_call<DB, S>(
+    service: &mut S,
+    request: Request<DB>,
+) -> BoxFuture<'_, Result<Response<DB>, Error>>
+where
+    DB: Database,
+    S: Service<
+            Request<DB>,
+            Response = Response<DB>,
+            Error = Error,
+            Future = BoxFuture<'static, Result<Response<DB>, Error>>,
+        > + Send,
+{
+    match service.poll_ready(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(())) => service.call(request),
+        Poll::Ready(Err(e)) => Box::pin(future::ready(Err(e))),
+        Poll::Pending => Box::pin(async move {
+            poll_fn(|cx| service.poll_ready(cx)).await?;
+            service.call(request).await
+        }),
     }
 }
 
