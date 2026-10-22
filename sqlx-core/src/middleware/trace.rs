@@ -20,7 +20,8 @@ use tracing::{Instrument, Span};
 use crate::database::Database;
 use crate::error::{BoxDynError, Error};
 use crate::middleware::{
-    into_sqlx_error, Layer, Request, Response, ResultItem, ResultStream, Service,
+    into_sqlx_error, ConnectRequest, ConnectionInfo, Layer, Request, Response, ResultItem,
+    ResultStream, Service,
 };
 
 /// A [`Layer`] which creates a [`tracing`] span for each request, following the
@@ -52,6 +53,15 @@ use crate::middleware::{
 ///
 /// When exported to Datadog through OpenTelemetry, these attributes are mapped to Datadog's
 /// conventions for SQL spans (`span.type = sql`, with the query text as the resource name).
+///
+/// # Connecting
+/// `TraceLayer` can also be added with [`ConnectOptions::connect_layer()`] to create a span for
+/// each attempt to open a connection. These spans have the target `sqlx::connect`, the name
+/// `sqlx.connect`, and the fields above that apply to connecting: `otel.name` (which is
+/// `connect`), `otel.kind`, `otel.status_code`, `db.system.name`, `db.namespace`,
+/// `db.response.status_code`, `error.type`, `server.address` and `server.port`.
+///
+/// [`ConnectOptions::connect_layer()`]: crate::connection::ConnectOptions::connect_layer
 ///
 /// # Example
 /// ```rust,no_run
@@ -193,6 +203,74 @@ where
     }
 }
 
+impl<DB, S> Service<ConnectRequest<DB>> for Trace<S>
+where
+    DB: Database,
+    S: Service<ConnectRequest<DB>, Response = DB::Connection>,
+    S::Error: Into<BoxDynError> + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = DB::Connection;
+    type Error = Error;
+    type Future = BoxFuture<'static, Result<DB::Connection, Error>>;
+
+    #[inline]
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(into_sqlx_error)
+    }
+
+    fn call(&mut self, request: ConnectRequest<DB>) -> Self::Future {
+        let span = connect_span(&request);
+        let response = self.inner.call(request).instrument(span.clone());
+
+        Box::pin(async move {
+            response
+                .await
+                .map_err(into_sqlx_error)
+                .inspect_err(|e| record_error(&span, e))
+        })
+    }
+}
+
+fn connect_span<DB: Database>(request: &ConnectRequest<DB>) -> Span {
+    let system = system_name::<DB>();
+
+    let span = tracing::info_span!(
+        target: "sqlx::connect",
+        "sqlx.connect",
+        otel.name = "connect",
+        otel.kind = "client",
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+        db.system.name = &*system,
+        db.namespace = Empty,
+        db.response.status_code = Empty,
+        error.type = Empty,
+        server.address = Empty,
+        server.port = Empty,
+    );
+
+    if !span.is_disabled() {
+        record_connection_info(&span, &request.connection_info());
+    }
+
+    span
+}
+
+fn record_connection_info(span: &Span, info: &ConnectionInfo) {
+    if let Some(database) = &info.database {
+        span.record("db.namespace", database.as_str());
+    }
+
+    if let Some(address) = &info.server_address {
+        span.record("server.address", address.as_str());
+    }
+
+    if let Some(port) = info.server_port {
+        span.record("server.port", port);
+    }
+}
+
 fn request_span<DB: Database>(request: &Request<DB>, query_text: bool) -> Span {
     let system = system_name::<DB>();
     let summary = request
@@ -228,17 +306,7 @@ fn request_span<DB: Database>(request: &Request<DB>, query_text: bool) -> Span {
     }
 
     if let Some(info) = request.connection_info() {
-        if let Some(database) = &info.database {
-            span.record("db.namespace", database.as_str());
-        }
-
-        if let Some(address) = &info.server_address {
-            span.record("server.address", address.as_str());
-        }
-
-        if let Some(port) = info.server_port {
-            span.record("server.port", port);
-        }
+        record_connection_info(&span, info);
     }
 
     span

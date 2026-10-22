@@ -2,9 +2,8 @@ use crate::connection::ConnectOptions;
 use crate::error::Error;
 use crate::{PgConnectOptions, PgConnection, Postgres};
 use log::LevelFilter;
-use sqlx_core::middleware::{BoxService, ConnectionInfo, Layers};
+use sqlx_core::middleware::{BoxService, ConnectLayers, ConnectionInfo, Layers};
 use sqlx_core::Url;
-use std::future::Future;
 use std::time::Duration;
 
 impl ConnectOptions for PgConnectOptions {
@@ -18,11 +17,19 @@ impl ConnectOptions for PgConnectOptions {
         self.build_url()
     }
 
-    fn connect(&self) -> impl Future<Output = Result<Self::Connection, Error>> + Send + '_
+    async fn connect(&self) -> Result<Self::Connection, Error>
     where
         Self::Connection: Sized,
     {
-        PgConnection::establish(self)
+        if self.connect_layers.is_empty() {
+            PgConnection::establish(self).await
+        } else {
+            self.connect_layers
+                .connect(self, |options| {
+                    Box::pin(async move { PgConnection::establish(&options).await })
+                })
+                .await
+        }
     }
 
     fn log_statements(mut self, level: LevelFilter) -> Self {
@@ -41,6 +48,14 @@ impl ConnectOptions for PgConnectOptions {
 
     fn layers_mut(&mut self) -> &mut Layers<BoxService<Postgres>> {
         &mut self.layers
+    }
+
+    fn connect_layers(&self) -> &ConnectLayers<Postgres> {
+        &self.connect_layers
+    }
+
+    fn connect_layers_mut(&mut self) -> &mut ConnectLayers<Postgres> {
+        &mut self.connect_layers
     }
 
     fn connection_info(&self) -> ConnectionInfo {

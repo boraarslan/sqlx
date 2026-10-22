@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * `ConnectOptions::layer()` (and an inherent `layer()` on each driver's connect options) adds middleware to every
     connection made with those options, including the connections of a pool.
   * `PoolOptions::layer()` adds middleware for queries executed directly on a `&Pool`, before a connection is acquired.
+  * `ConnectOptions::connect_layer()` (and an inherent `connect_layer()` on each driver's connect options) adds
+    middleware around opening connections: each attempt to connect is a `middleware::ConnectRequest` holding the
+    connect options, which middleware can change (e.g. to use short-lived credentials like AWS RDS IAM tokens),
+    time out, retry or trace. There is one connect middleware stack per set of connect options, shared by all the
+    connections of a pool. `middleware::connect_fn()` creates connect middleware from an async closure, and
+    `TraceLayer` also creates spans for connects.
   * Connections and pools implement `tower::Service<Request<DB>>`, and `middleware::ServiceExecutor` turns any such
     service back into an `Executor`, so middleware can also be applied ad hoc.
   * `middleware::from_fn()` creates middleware from an async closure.
@@ -30,7 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (which implement `fetch_many()`, `fetch_optional()`, `prepare_with()` and `describe()`) keep working, as `dispatch()`
   has a default implementation that returns an error, but they should implement `dispatch()` instead, which is
   required to use them with middleware APIs like `ServiceExecutor`.
-* `ConnectOptions` has the new required methods `layers()` and `layers_mut()`.
+* `ConnectOptions` has the new required methods `layers()`, `layers_mut()`, `connect_layers()` and
+  `connect_layers_mut()`.
 * `AnyConnectionBackend` replaces `fetch_many()`, `fetch_optional()`, `prepare_with()`, `describe()`, `begin()`,
   `commit()` and `rollback()` with `service()`, which returns a `'static` request service.
   `get_transaction_depth()` is now required.

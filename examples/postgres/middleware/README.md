@@ -8,6 +8,8 @@ Shows how to add [Tower](https://docs.rs/tower) middleware to SQLx connections a
   to a backend like Datadog, these are recognized as SQL spans with the query as the resource name.
 * `sqlx::middleware::from_fn()` turns an async function into middleware; here, to log slow statements.
 * `tower::timeout::TimeoutLayer` and `tower::limit::GlobalConcurrencyLimitLayer` are generic Tower middleware.
+* `connect_layer()` adds middleware around opening connections; here, a span and a timeout for each attempt to
+  connect.
 
 ## Usage
 

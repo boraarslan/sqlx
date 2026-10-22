@@ -318,3 +318,91 @@ async fn it_supports_layers_on_any_connections() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[sqlx_macros::test]
+async fn it_sends_connects_through_connect_layers() -> anyhow::Result<()> {
+    use sqlx::middleware::{ConnectNext, ConnectRequest};
+
+    let connects = Arc::new(Mutex::new(Vec::new()));
+
+    // Records each connect, and changes the options used to connect.
+    let options = memory().connect_layer(middleware::connect_fn({
+        let connects = connects.clone();
+        move |request: ConnectRequest<Sqlite>, next: ConnectNext<Sqlite>| {
+            connects.lock().unwrap().push(request.connection_info());
+            next.run(request.map_options(|options| options.foreign_keys(false)))
+        }
+    }));
+
+    let mut conn = SqliteConnection::connect_with(&options).await?;
+    let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(foreign_keys, 0);
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(2)
+        .connect_with(options)
+        .await?;
+    let a = pool.acquire().await?;
+    let b = pool.acquire().await?;
+    drop((a, b));
+    pool.close().await;
+
+    let connects = std::mem::take(&mut *connects.lock().unwrap());
+    assert_eq!(connects.len(), 3, "{connects:?}");
+    assert!(connects
+        .iter()
+        .all(|info| info.database.as_deref() == Some(":memory:")));
+
+    // Errors from connecting are returned unchanged.
+    let dir = tempfile::tempdir()?;
+    let options = SqliteConnectOptions::new()
+        .filename(dir.path().join("db.sqlite"))
+        .create_if_missing(true);
+
+    let err = SqliteConnection::connect_with(&options.connect_layer(middleware::connect_fn(
+        |request: ConnectRequest<Sqlite>, next: ConnectNext<Sqlite>| {
+            next.run(request.map_options(|options| options.create_if_missing(false)))
+        },
+    )))
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::Database(_)), "{err:?}");
+
+    Ok(())
+}
+
+#[cfg(feature = "any")]
+#[sqlx_macros::test]
+async fn it_supports_connect_layers_on_any_connections() -> anyhow::Result<()> {
+    use sqlx::any::{Any, AnyConnectOptions};
+    use sqlx::middleware::{ConnectNext, ConnectRequest};
+    use sqlx::AnyConnection;
+
+    sqlx::any::install_default_drivers();
+
+    let connects = Arc::new(Mutex::new(Vec::new()));
+    let options: AnyConnectOptions = "sqlite::memory:".parse()?;
+    let options = options.connect_layer(middleware::connect_fn({
+        let connects = connects.clone();
+        move |request: ConnectRequest<Any>, next: ConnectNext<Any>| {
+            connects
+                .lock()
+                .unwrap()
+                .push(request.options().database_url.to_string());
+            next.run(request)
+        }
+    }));
+
+    let mut conn = AnyConnection::connect_with(&options).await?;
+    let value: i64 = sqlx::query_scalar("SELECT 1").fetch_one(&mut conn).await?;
+    assert_eq!(value, 1);
+
+    assert_eq!(
+        *connects.lock().unwrap(),
+        vec!["sqlite::memory:".to_owned()]
+    );
+
+    Ok(())
+}

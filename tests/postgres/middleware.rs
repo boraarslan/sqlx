@@ -813,3 +813,280 @@ async fn it_traces_requests_with_otel_conventions() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[sqlx_macros::test]
+async fn it_sends_connects_through_connect_layers() -> anyhow::Result<()> {
+    use sqlx::middleware::{ConnectNext, ConnectRequest};
+
+    let options = connect_options()?;
+    let connects = Arc::new(Mutex::new(Vec::new()));
+
+    let layered = options.clone().connect_layer(middleware::connect_fn({
+        let connects = connects.clone();
+        move |request: ConnectRequest<Postgres>, next: ConnectNext<Postgres>| {
+            connects.lock().unwrap().push(request.connection_info());
+            next.run(request)
+        }
+    }));
+
+    let mut conn = PgConnection::connect_with(&layered).await?;
+    conn.ping().await?;
+    conn.close().await?;
+
+    // The pool opens one connection to check the options, and a second one for `b`.
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(layered)
+        .await?;
+    let a = pool.acquire().await?;
+    let b = pool.acquire().await?;
+    drop((a, b));
+    pool.close().await;
+
+    let connects = std::mem::take(&mut *connects.lock().unwrap());
+    assert_eq!(connects.len(), 3, "{connects:?}");
+
+    for info in &connects {
+        assert_eq!(info.server_address.as_deref(), Some(options.get_host()));
+        assert_eq!(info.server_port, Some(options.get_port()));
+        assert_eq!(info.database.as_deref(), options.get_database());
+        assert_eq!(info.user.as_deref(), Some(options.get_username()));
+    }
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_can_change_connect_options_in_connect_layers() -> anyhow::Result<()> {
+    use sqlx::middleware::{ConnectNext, ConnectRequest};
+
+    let options = connect_options()?.application_name("sqlx-before-middleware");
+
+    let mut conn =
+        PgConnection::connect_with(&options.clone().connect_layer(middleware::connect_fn(
+            |request: ConnectRequest<Postgres>, next: ConnectNext<Postgres>| {
+                next.run(
+                    request
+                        .map_options(|options| options.application_name("sqlx-connect-middleware")),
+                )
+            },
+        )))
+        .await?;
+
+    let application_name: String = sqlx::query_scalar("SELECT current_setting('application_name')")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(application_name, "sqlx-connect-middleware");
+
+    // Errors from connecting with the changed options are returned unchanged.
+    let err = PgConnection::connect_with(&options.connect_layer(middleware::connect_fn(
+        |mut request: ConnectRequest<Postgres>, next: ConnectNext<Postgres>| {
+            *request.options_mut() = request
+                .options()
+                .clone()
+                .database("sqlx_middleware_does_not_exist");
+            next.run(request)
+        },
+    )))
+    .await
+    .unwrap_err();
+
+    let code = err.as_database_error().and_then(|e| e.code());
+    assert_eq!(code.as_deref(), Some("3D000"), "{err:?}");
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_shares_the_connect_stack_between_connections() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    use sqlx::middleware::{ConnectRequest, Service};
+
+    /// Counts how often its stack is built, and the connects made by each instance.
+    #[derive(Clone, Default)]
+    struct CountLayer {
+        built: Arc<AtomicUsize>,
+        connects: Arc<Mutex<Vec<(usize, usize)>>>,
+    }
+
+    struct Count<S> {
+        inner: S,
+        instance: usize,
+        connects: usize,
+        log: Arc<Mutex<Vec<(usize, usize)>>>,
+    }
+
+    impl<S> Layer<S> for CountLayer {
+        type Service = Count<S>;
+
+        fn layer(&self, inner: S) -> Count<S> {
+            Count {
+                inner,
+                instance: self.built.fetch_add(1, Ordering::SeqCst),
+                connects: 0,
+                log: self.connects.clone(),
+            }
+        }
+    }
+
+    impl<S: Service<ConnectRequest<Postgres>>> Service<ConnectRequest<Postgres>> for Count<S> {
+        type Response = S::Response;
+        type Error = S::Error;
+        type Future = S::Future;
+
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.inner.poll_ready(cx)
+        }
+
+        fn call(&mut self, request: ConnectRequest<Postgres>) -> Self::Future {
+            self.connects += 1;
+            self.log
+                .lock()
+                .unwrap()
+                .push((self.instance, self.connects));
+            self.inner.call(request)
+        }
+    }
+
+    let layer = CountLayer::default();
+    let options = connect_options()?.connect_layer(layer.clone());
+
+    // Clones of the options share the stack.
+    let _a = PgConnection::connect_with(&options).await?;
+    let _b = PgConnection::connect_with(&options.clone()).await?;
+
+    // Adding a layer creates a new stack, but doesn't change the stack of the original options.
+    let extended = options
+        .clone()
+        .connect_layer(tower::layer::util::Identity::new());
+    let _c = PgConnection::connect_with(&extended).await?;
+    let _d = PgConnection::connect_with(&options).await?;
+
+    assert_eq!(layer.built.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *layer.connects.lock().unwrap(),
+        vec![(0, 1), (0, 2), (1, 1), (0, 3)]
+    );
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_works_with_tower_middleware_for_connects() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use sqlx::middleware::{ConnectNext, ConnectRequest};
+    use tower::retry::{Policy, RetryLayer};
+
+    #[derive(Clone)]
+    struct RetryOnce;
+
+    impl<Req: Clone, Res, E> Policy<Req, Res, E> for RetryOnce {
+        type Future = std::future::Ready<()>;
+
+        fn retry(&mut self, _req: &mut Req, result: &mut Result<Res, E>) -> Option<Self::Future> {
+            result.is_err().then(|| std::future::ready(()))
+        }
+
+        fn clone_request(&mut self, req: &Req) -> Option<Req> {
+            Some(req.clone())
+        }
+    }
+
+    // Fails the first attempt to connect.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let flaky = middleware::connect_fn({
+        let attempts = attempts.clone();
+        move |request: ConnectRequest<Postgres>, next: ConnectNext<Postgres>| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+
+            async move {
+                if attempt == 0 {
+                    return Err(Error::Protocol("simulated transient failure".into()));
+                }
+
+                next.run(request).await
+            }
+        }
+    });
+
+    let mut conn = PgConnection::connect_with(
+        &connect_options()?
+            .connect_layer(RetryLayer::new(RetryOnce))
+            .connect_layer(flaky),
+    )
+    .await?;
+    conn.ping().await?;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    #[cfg(feature = "_rt-tokio")]
+    {
+        use tower::timeout::{error::Elapsed, TimeoutLayer};
+
+        let slow = middleware::connect_fn(
+            |request: ConnectRequest<Postgres>, next: ConnectNext<Postgres>| async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                next.run(request).await
+            },
+        );
+
+        let err = PgConnection::connect_with(
+            &connect_options()?
+                .connect_layer(TimeoutLayer::new(Duration::from_millis(50)))
+                .connect_layer(slow),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            Error::Middleware(e) => assert!(e.is::<Elapsed>(), "{e:?}"),
+            other => panic!("expected Error::Middleware, got {other:?}"),
+        }
+    }
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_traces_connects() -> anyhow::Result<()> {
+    use sqlx::middleware::trace::TraceLayer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let capture = span_capture::SpanCapture::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+
+    let options = connect_options()?.connect_layer(TraceLayer::new());
+
+    let conn = PgConnection::connect_with(&options).await?;
+    conn.close().await?;
+
+    PgConnection::connect_with(&options.clone().database("sqlx_middleware_does_not_exist"))
+        .await
+        .unwrap_err();
+
+    let spans = std::mem::take(&mut *capture.0.lock().unwrap());
+    assert_eq!(spans.len(), 2, "{spans:#?}");
+
+    let (name, fields) = &spans[0];
+    assert_eq!(*name, "sqlx.connect");
+    assert_eq!(fields["otel.name"], "connect");
+    assert_eq!(fields["otel.kind"], "client");
+    assert_eq!(fields["db.system.name"], "postgresql");
+    assert_eq!(
+        fields.get("db.namespace").map(String::as_str),
+        options.get_database()
+    );
+    assert_eq!(fields["server.address"], options.get_host());
+    assert_eq!(fields["server.port"], options.get_port().to_string());
+    assert!(!fields.contains_key("error.type"), "{fields:?}");
+
+    let (_, fields) = &spans[1];
+    assert_eq!(fields["db.namespace"], "sqlx_middleware_does_not_exist");
+    assert_eq!(fields["otel.status_code"], "ERROR");
+    assert_eq!(fields["error.type"], "3D000");
+
+    Ok(())
+}

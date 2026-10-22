@@ -6,7 +6,7 @@
 //! Any [`Layer`] that works with generic Tower services can be added to this stack,
 //! including those in the `tower` crate (timeouts, concurrency and rate limits, retries, ...).
 //!
-//! Middleware can be added in three places:
+//! Middleware can be added in four places:
 //!
 //! * **Connections**: [`ConnectOptions::layer()`] (and the inherent `layer()` methods of each
 //!   driver's connect options) adds a layer to every connection made with those options,
@@ -19,6 +19,8 @@
 //! * **Ad-hoc executors**: connections, transactions and pools implement
 //!   `Service<Request<DB>>`, so any of them can be wrapped in layers, e.g. with
 //!   `tower::ServiceBuilder`, and turned back into an [`Executor`] with [`ServiceExecutor`].
+//! * **Connecting**: [`ConnectOptions::connect_layer()`] adds a layer around opening
+//!   connections; see [Connecting](#connecting).
 //!
 //! Layers are applied like `tower::ServiceBuilder`: the first layer added is the outermost
 //! and sees each request first.
@@ -94,6 +96,49 @@
 //! on the connection waits for the query to finish. Consider setting a statement timeout on the
 //! server (e.g. `statement_timeout` in Postgres) as well.
 //!
+//! # Connecting
+//! Each attempt to open a connection, including those made by a [`Pool`], is sent through the
+//! layers added with [`ConnectOptions::connect_layer()`] as a [`ConnectRequest`], which holds the
+//! connect options. The response is the new connection. Connect middleware can:
+//!
+//! * change the options, e.g. to use a password that's only valid for a short time (like an
+//!   AWS RDS IAM authentication token) or to pick one of several servers;
+//! * time out or retry attempts to connect, or limit how often they're made
+//!   (e.g. with `tower::timeout`, `tower::retry` or `tower::limit::RateLimit`);
+//! * trace them, with [`trace::TraceLayer`].
+//!
+//! [`connect_fn()`] creates connect middleware from an async function, like [`from_fn()`]:
+//!
+//! ```rust,no_run
+//! use sqlx::middleware::{self, ConnectNext, ConnectRequest};
+//! use sqlx::postgres::{PgConnectOptions, Postgres};
+//! use sqlx::{Connection, PgConnection};
+//!
+//! # async fn example() -> sqlx::Result<()> {
+//! let options: PgConnectOptions = "postgres://localhost/mydb".parse()?;
+//!
+//! let options = options.connect_layer(middleware::connect_fn(
+//!     |request: ConnectRequest<Postgres>, next: ConnectNext<Postgres>| async move {
+//!         let info = request.connection_info();
+//!         println!("connecting to {:?}", info.server_address);
+//!
+//!         next.run(request).await
+//!     },
+//! ));
+//!
+//! let conn = PgConnection::connect_with(&options).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Unlike the middleware stack of a connection, there is one instance of the connect middleware
+//! stack, shared by all clones of the connect options (e.g. all connections of a pool), so
+//! stateful middleware applies to all attempts to connect. See [`ConnectLayers`].
+//!
+//! The statements that initialize a new connection (e.g. MySQL's `SET` statement and SQLite's
+//! `PRAGMA`s) are part of the connect request; they don't pass through the layers added with
+//! [`ConnectOptions::layer()`].
+//!
 //! # Errors
 //! Middleware may return any error type that converts into a boxed error (like `tower::BoxError`).
 //! Errors are converted back into [`Error`]: if the error is an [`Error`], it's passed through
@@ -101,10 +146,11 @@
 //! returns `Error::Middleware` wrapping `tower::timeout::error::Elapsed`.
 //!
 //! # Notes on Tower Middleware
-//! * Middleware services are type-erased with [`BoxService`], which is `Clone`: its clones
-//!   share the same instance of the middleware, so middleware which needs to clone its inner
-//!   service (like `tower::retry::Retry`) can be used anywhere.
-//! * A layer added to connect options is applied to each connection separately, so
+//! * Middleware services are type-erased with [`BoxService`] (and connect middleware with
+//!   [`BoxConnectService`]), which is `Clone`: its clones share the same instance of the
+//!   middleware, so middleware which needs to clone its inner service (like
+//!   `tower::retry::Retry`) can be used anywhere.
+//! * A layer added with `ConnectOptions::layer()` is applied to each connection separately, so
 //!   `tower::limit::ConcurrencyLimitLayer` limits concurrency per connection (which is always 1).
 //!   Use `tower::limit::GlobalConcurrencyLimitLayer`, or add the layer to the pool, to limit
 //!   concurrency across connections.
@@ -114,8 +160,9 @@
 //!   the transaction; see [`Request::in_transaction()`].
 //!
 //! # What Doesn't Pass Through Middleware
-//! * Establishing connections, including the statements used to initialize them (e.g. MySQL's
-//!   `SET` statement and SQLite's `PRAGMA`s), and pings (e.g. `PoolOptions::test_before_acquire`).
+//! * The statements used to initialize connections (e.g. MySQL's `SET` statement and SQLite's
+//!   `PRAGMA`s), which are part of the [connect request](#connecting) instead, and pings
+//!   (e.g. `PoolOptions::test_before_acquire`).
 //! * Queries the driver makes on its own to handle a request, e.g. resolving custom types in
 //!   Postgres. These are part of the request that triggered them.
 //! * `COPY` in Postgres, and notifications received by `PgListener` (statements like `LISTEN`
@@ -183,6 +230,7 @@
 //!
 //! [Tower]: https://docs.rs/tower
 //! [`ConnectOptions::layer()`]: crate::connection::ConnectOptions::layer
+//! [`ConnectOptions::connect_layer()`]: crate::connection::ConnectOptions::connect_layer
 //! [`PoolOptions::layer()`]: crate::pool::PoolOptions::layer
 //! [`Pool`]: crate::pool::Pool
 //! [`PoolConnection`]: crate::pool::PoolConnection
@@ -192,6 +240,7 @@
 //! [`Error::Middleware`]: crate::error::Error::Middleware
 
 mod boxed;
+mod connect;
 mod executor;
 mod extensions;
 mod from_fn;
@@ -202,7 +251,10 @@ pub mod trace;
 
 #[doc(hidden)]
 pub use boxed::ConnectionService;
-pub use boxed::{into_sqlx_error, BoxService, Layers};
+pub use boxed::{into_sqlx_error, BoxConnectService, BoxService, Layers};
+pub use connect::{
+    connect_fn, ConnectFn, ConnectFnLayer, ConnectLayers, ConnectNext, ConnectRequest,
+};
 pub use executor::ServiceExecutor;
 pub use extensions::Extensions;
 pub use from_fn::{from_fn, FromFn, FromFnLayer, Next};

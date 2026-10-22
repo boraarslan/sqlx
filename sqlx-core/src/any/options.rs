@@ -2,9 +2,11 @@ use crate::any::{Any, AnyConnection};
 use crate::connection::{ConnectOptions, LogSettings};
 use crate::error::BoxDynError;
 use crate::error::Error;
-use crate::middleware::{BoxService, ConnectionInfo, Layer, Layers, Request, Response, Service};
+use crate::middleware::{
+    BoxConnectService, BoxService, ConnectLayers, ConnectRequest, ConnectionInfo, Layer, Layers,
+    Request, Response, Service,
+};
 use log::LevelFilter;
-use std::future::Future;
 use std::str::FromStr;
 use std::time::Duration;
 use url::Url;
@@ -22,6 +24,7 @@ pub struct AnyConnectOptions {
     pub database_url: Url,
     pub log_settings: LogSettings,
     pub(crate) layers: Layers<BoxService<Any>>,
+    pub(crate) connect_layers: ConnectLayers<Any>,
 }
 impl FromStr for AnyConnectOptions {
     type Err = Error;
@@ -33,6 +36,7 @@ impl FromStr for AnyConnectOptions {
                 .map_err(|e| Error::Configuration(e.into()))?,
             log_settings: LogSettings::default(),
             layers: Layers::new(),
+            connect_layers: ConnectLayers::new(),
         })
     }
 }
@@ -45,6 +49,7 @@ impl ConnectOptions for AnyConnectOptions {
             database_url: url.clone(),
             log_settings: LogSettings::default(),
             layers: Layers::new(),
+            connect_layers: ConnectLayers::new(),
         })
     }
 
@@ -52,9 +57,16 @@ impl ConnectOptions for AnyConnectOptions {
         self.database_url.clone()
     }
 
-    #[inline]
-    fn connect(&self) -> impl Future<Output = Result<AnyConnection, Error>> + Send + '_ {
-        AnyConnection::connect(self)
+    async fn connect(&self) -> Result<AnyConnection, Error> {
+        if self.connect_layers.is_empty() {
+            AnyConnection::connect(self).await
+        } else {
+            self.connect_layers
+                .connect(self, |options| {
+                    Box::pin(async move { AnyConnection::connect(&options).await })
+                })
+                .await
+        }
     }
 
     fn log_statements(mut self, level: LevelFilter) -> Self {
@@ -74,6 +86,14 @@ impl ConnectOptions for AnyConnectOptions {
 
     fn layers_mut(&mut self) -> &mut Layers<BoxService<Any>> {
         &mut self.layers
+    }
+
+    fn connect_layers(&self) -> &ConnectLayers<Any> {
+        &self.connect_layers
+    }
+
+    fn connect_layers_mut(&mut self) -> &mut ConnectLayers<Any> {
+        &mut self.connect_layers
     }
 
     fn connection_info(&self) -> ConnectionInfo {
@@ -116,5 +136,21 @@ impl AnyConnectOptions {
         <L::Service as Service<Request<Any>>>::Future: Send + 'static,
     {
         ConnectOptions::layer(self, layer)
+    }
+
+    /// Add a [Tower] middleware [`Layer`] around opening connections with these options.
+    ///
+    /// See [`ConnectOptions::connect_layer()`] and the [`middleware`][crate::middleware] module
+    /// for details.
+    ///
+    /// [Tower]: https://docs.rs/tower
+    pub fn connect_layer<L>(self, layer: L) -> Self
+    where
+        L: Layer<BoxConnectService<Any>> + Send + Sync + 'static,
+        L::Service: Service<ConnectRequest<Any>, Response = AnyConnection> + Send + 'static,
+        <L::Service as Service<ConnectRequest<Any>>>::Error: Into<BoxDynError> + 'static,
+        <L::Service as Service<ConnectRequest<Any>>>::Future: Send + 'static,
+    {
+        ConnectOptions::connect_layer(self, layer)
     }
 }

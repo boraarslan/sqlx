@@ -21,7 +21,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In production, you'd export the spans with `tracing-opentelemetry` instead.
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,sqlx::query=info".into()),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,sqlx::query=info,sqlx::connect=info".into()),
         )
         .with_span_events(FmtSpan::CLOSE)
         .init();
@@ -38,7 +39,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Middleware can be written as an async closure.
         .layer(middleware::from_fn(slow_query_log))
         // Generic Tower middleware works too. This limits the time to the first row.
-        .layer(TimeoutLayer::new(Duration::from_secs(5)));
+        .layer(TimeoutLayer::new(Duration::from_secs(5)))
+        // Connect middleware wraps each attempt to open a connection: here, a span for each
+        // attempt, which may take up to 10 seconds.
+        .connect_layer(TraceLayer::new())
+        .connect_layer(TimeoutLayer::new(Duration::from_secs(10)));
 
     let pool = PgPoolOptions::new()
         .max_connections(5)

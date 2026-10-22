@@ -4,7 +4,7 @@ use sqlx_core::config;
 use sqlx_core::connection::ConnectOptions;
 use sqlx_core::error::Error;
 use sqlx_core::executor::Executor;
-use sqlx_core::middleware::{BoxService, ConnectionInfo, Layers};
+use sqlx_core::middleware::{BoxService, ConnectLayers, ConnectionInfo, Layers};
 use sqlx_core::sql_str::AssertSqlSafe;
 use std::fmt::Write;
 use std::str::FromStr;
@@ -34,22 +34,15 @@ impl ConnectOptions for SqliteConnectOptions {
     where
         Self::Connection: Sized,
     {
-        let mut conn = SqliteConnection::establish(self).await?;
-
-        // Execute PRAGMAs
-        conn.execute(AssertSqlSafe(self.pragma_string())).await?;
-
-        if !self.collations.is_empty() {
-            let mut locked = conn.lock_handle().await?;
-
-            for collation in &self.collations {
-                collation.create(&mut locked.guard.handle)?;
-            }
+        if self.connect_layers.is_empty() {
+            self.establish().await
+        } else {
+            self.connect_layers
+                .connect(self, |options| {
+                    Box::pin(async move { options.establish().await })
+                })
+                .await
         }
-
-        conn.install_layers(&self.layers);
-
-        Ok(conn)
     }
 
     fn log_statements(mut self, level: LevelFilter) -> Self {
@@ -70,6 +63,14 @@ impl ConnectOptions for SqliteConnectOptions {
         &mut self.layers
     }
 
+    fn connect_layers(&self) -> &ConnectLayers<Sqlite> {
+        &self.connect_layers
+    }
+
+    fn connect_layers_mut(&mut self) -> &mut ConnectLayers<Sqlite> {
+        &mut self.connect_layers
+    }
+
     fn connection_info(&self) -> ConnectionInfo {
         if self.in_memory {
             ConnectionInfo::new().with_database(":memory:")
@@ -87,6 +88,26 @@ impl ConnectOptions for SqliteConnectOptions {
 }
 
 impl SqliteConnectOptions {
+    /// Open and initialize a connection, without going through connect middleware.
+    async fn establish(&self) -> Result<SqliteConnection, Error> {
+        let mut conn = SqliteConnection::establish(self).await?;
+
+        // Execute PRAGMAs
+        conn.execute(AssertSqlSafe(self.pragma_string())).await?;
+
+        if !self.collations.is_empty() {
+            let mut locked = conn.lock_handle().await?;
+
+            for collation in &self.collations {
+                collation.create(&mut locked.guard.handle)?;
+            }
+        }
+
+        conn.install_layers(&self.layers);
+
+        Ok(conn)
+    }
+
     /// Collect all `PRAMGA` commands into a single string
     pub(crate) fn pragma_string(&self) -> String {
         let mut string = String::new();

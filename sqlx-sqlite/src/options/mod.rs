@@ -18,10 +18,13 @@ pub use synchronous::SqliteSynchronous;
 
 use crate::common::DebugFn;
 use crate::connection::collation::Collation;
-use crate::Sqlite;
+use crate::{Sqlite, SqliteConnection};
 use sqlx_core::connection::ConnectOptions;
 use sqlx_core::error::BoxDynError;
-use sqlx_core::middleware::{BoxService, Layer, Layers, Request, Response, Service};
+use sqlx_core::middleware::{
+    BoxConnectService, BoxService, ConnectLayers, ConnectRequest, Layer, Layers, Request, Response,
+    Service,
+};
 use sqlx_core::{config, IndexMap};
 
 /// Options and flags which can be used to configure a SQLite connection.
@@ -98,6 +101,7 @@ pub struct SqliteConnectOptions {
     pub(crate) register_regexp_function: bool,
 
     pub(crate) layers: Layers<BoxService<Sqlite>>,
+    pub(crate) connect_layers: ConnectLayers<Sqlite>,
 }
 
 #[derive(Clone, Debug)]
@@ -222,6 +226,7 @@ impl SqliteConnectOptions {
             #[cfg(feature = "regexp")]
             register_regexp_function: false,
             layers: Layers::new(),
+            connect_layers: ConnectLayers::new(),
         }
     }
 
@@ -239,6 +244,22 @@ impl SqliteConnectOptions {
         <L::Service as Service<Request<Sqlite>>>::Future: Send + 'static,
     {
         ConnectOptions::layer(self, layer)
+    }
+
+    /// Add a [Tower] middleware [`Layer`] around opening connections with these options.
+    ///
+    /// See [`ConnectOptions::connect_layer()`][sqlx_core::connection::ConnectOptions::connect_layer]
+    /// and the [`middleware`][sqlx_core::middleware] module for details.
+    ///
+    /// [Tower]: https://docs.rs/tower
+    pub fn connect_layer<L>(self, layer: L) -> Self
+    where
+        L: Layer<BoxConnectService<Sqlite>> + Send + Sync + 'static,
+        L::Service: Service<ConnectRequest<Sqlite>, Response = SqliteConnection> + Send + 'static,
+        <L::Service as Service<ConnectRequest<Sqlite>>>::Error: Into<BoxDynError> + 'static,
+        <L::Service as Service<ConnectRequest<Sqlite>>>::Future: Send + 'static,
+    {
+        ConnectOptions::connect_layer(self, layer)
     }
 
     /// Sets the name of the database file.

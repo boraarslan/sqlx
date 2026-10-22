@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::executor::Executor;
 use crate::{MySql, MySqlConnectOptions, MySqlConnection};
 use log::LevelFilter;
-use sqlx_core::middleware::{BoxService, ConnectionInfo, Layers};
+use sqlx_core::middleware::{BoxService, ConnectLayers, ConnectionInfo, Layers};
 use sqlx_core::sql_str::AssertSqlSafe;
 use sqlx_core::Url;
 use std::time::Duration;
@@ -23,6 +23,62 @@ impl ConnectOptions for MySqlConnectOptions {
     where
         Self::Connection: Sized,
     {
+        if self.connect_layers.is_empty() {
+            self.establish().await
+        } else {
+            self.connect_layers
+                .connect(self, |options| {
+                    Box::pin(async move { options.establish().await })
+                })
+                .await
+        }
+    }
+
+    fn log_statements(mut self, level: LevelFilter) -> Self {
+        self.log_settings.log_statements(level);
+        self
+    }
+
+    fn log_slow_statements(mut self, level: LevelFilter, duration: Duration) -> Self {
+        self.log_settings.log_slow_statements(level, duration);
+        self
+    }
+
+    fn layers(&self) -> &Layers<BoxService<MySql>> {
+        &self.layers
+    }
+
+    fn layers_mut(&mut self) -> &mut Layers<BoxService<MySql>> {
+        &mut self.layers
+    }
+
+    fn connect_layers(&self) -> &ConnectLayers<MySql> {
+        &self.connect_layers
+    }
+
+    fn connect_layers_mut(&mut self) -> &mut ConnectLayers<MySql> {
+        &mut self.connect_layers
+    }
+
+    fn connection_info(&self) -> ConnectionInfo {
+        let mut info = ConnectionInfo::new().with_user(&self.username);
+
+        if let Some(database) = &self.database {
+            info = info.with_database(database);
+        }
+
+        match &self.socket {
+            Some(socket) => info.with_server_address(socket.to_string_lossy()),
+            None => info
+                .with_server_address(&self.host)
+                .with_server_port(self.port),
+        }
+    }
+}
+
+impl MySqlConnectOptions {
+    /// Open and initialize a connection, without going through connect middleware.
+    async fn establish(&self) -> Result<MySqlConnection, Error> {
         let mut conn = MySqlConnection::establish(self).await?;
 
         // After the connection is established, we initialize by configuring a few
@@ -92,38 +148,5 @@ impl ConnectOptions for MySqlConnectOptions {
         conn.install_layers(&self.layers);
 
         Ok(conn)
-    }
-
-    fn log_statements(mut self, level: LevelFilter) -> Self {
-        self.log_settings.log_statements(level);
-        self
-    }
-
-    fn log_slow_statements(mut self, level: LevelFilter, duration: Duration) -> Self {
-        self.log_settings.log_slow_statements(level, duration);
-        self
-    }
-
-    fn layers(&self) -> &Layers<BoxService<MySql>> {
-        &self.layers
-    }
-
-    fn layers_mut(&mut self) -> &mut Layers<BoxService<MySql>> {
-        &mut self.layers
-    }
-
-    fn connection_info(&self) -> ConnectionInfo {
-        let mut info = ConnectionInfo::new().with_user(&self.username);
-
-        if let Some(database) = &self.database {
-            info = info.with_database(database);
-        }
-
-        match &self.socket {
-            Some(socket) => info.with_server_address(socket.to_string_lossy()),
-            None => info
-                .with_server_address(&self.host)
-                .with_server_port(self.port),
-        }
     }
 }

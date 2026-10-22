@@ -3,7 +3,10 @@ use crate::error::Error;
 
 use crate::config;
 use crate::error::BoxDynError;
-use crate::middleware::{BoxService, ConnectionInfo, Layer, Layers, Request, Response, Service};
+use crate::middleware::{
+    BoxConnectService, BoxService, ConnectLayers, ConnectRequest, ConnectionInfo, Layer, Layers,
+    Request, Response, Service,
+};
 use crate::sql_str::SqlSafeStr;
 use crate::transaction::{Transaction, TransactionManager};
 use futures_core::future::BoxFuture;
@@ -323,6 +326,70 @@ pub trait ConnectOptions: 'static + Send + Sync + FromStr<Err = Error> + Debug +
     /// A mutable reference to the middleware layers added with [`layer()`][Self::layer].
     fn layers_mut(&mut self)
         -> &mut Layers<BoxService<<Self::Connection as Connection>::Database>>;
+
+    /// Add a [Tower] middleware [`Layer`] around opening connections with these options.
+    ///
+    /// Every attempt to open a connection with these options, including those made by a
+    /// [`Pool`][crate::pool::Pool], is sent through the layer as a [`ConnectRequest`], to which
+    /// the new connection is the response. Middleware can change the options used to connect
+    /// (e.g. to set a short-lived password), retry or time out attempts to connect, or trace them.
+    ///
+    /// Unlike the layers added with [`layer()`][Self::layer], there is one instance of the
+    /// connect middleware stack, shared by all clones of these options (e.g. by all connections
+    /// of a pool), so state kept by a service (like a rate limit) applies to all attempts to
+    /// connect. See [`ConnectLayers`] for details.
+    ///
+    /// Layers are applied like `tower::ServiceBuilder`: the first layer added is the outermost
+    /// and sees each request first.
+    ///
+    /// ```rust,no_run
+    /// use std::time::Duration;
+    /// use sqlx::middleware::trace::TraceLayer;
+    /// use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    /// use tower::timeout::TimeoutLayer;
+    ///
+    /// # async fn example() -> sqlx::Result<()> {
+    /// let options = "postgres://localhost/mydb"
+    ///     .parse::<PgConnectOptions>()?
+    ///     // Create a span for each attempt to connect...
+    ///     .connect_layer(TraceLayer::new())
+    ///     // ...each of which may take up to 5 seconds.
+    ///     .connect_layer(TimeoutLayer::new(Duration::from_secs(5)));
+    ///
+    /// let pool = PgPoolOptions::new().connect_with(options).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [Tower]: https://docs.rs/tower
+    fn connect_layer<L>(mut self, layer: L) -> Self
+    where
+        L: Layer<BoxConnectService<<Self::Connection as Connection>::Database>>
+            + Send
+            + Sync
+            + 'static,
+        L::Service: Service<
+                ConnectRequest<<Self::Connection as Connection>::Database>,
+                Response = <<Self::Connection as Connection>::Database as Database>::Connection,
+            > + Send
+            + 'static,
+        <L::Service as Service<ConnectRequest<<Self::Connection as Connection>::Database>>>::Error:
+            Into<BoxDynError> + 'static,
+        <L::Service as Service<ConnectRequest<<Self::Connection as Connection>::Database>>>::Future:
+            Send + 'static,
+    {
+        self.connect_layers_mut().push(layer);
+        self
+    }
+
+    /// The connect middleware layers added with [`connect_layer()`][Self::connect_layer].
+    fn connect_layers(&self) -> &ConnectLayers<<Self::Connection as Connection>::Database>;
+
+    /// A mutable reference to the connect middleware layers added with
+    /// [`connect_layer()`][Self::connect_layer].
+    fn connect_layers_mut(
+        &mut self,
+    ) -> &mut ConnectLayers<<Self::Connection as Connection>::Database>;
 
     #[doc(hidden)]
     fn __unstable_apply_driver_config(

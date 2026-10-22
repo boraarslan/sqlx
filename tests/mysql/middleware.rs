@@ -282,3 +282,60 @@ async fn it_serializes_requests_while_a_response_is_detached() -> anyhow::Result
 
     Ok(())
 }
+
+#[sqlx_macros::test]
+async fn it_sends_connects_through_connect_layers() -> anyhow::Result<()> {
+    use sqlx::middleware::{ConnectNext, ConnectRequest};
+
+    let options = connect_options()?;
+    let connects = Arc::new(Mutex::new(Vec::new()));
+
+    // Records each connect, and changes the options used to connect.
+    let layered = options.clone().connect_layer(middleware::connect_fn({
+        let connects = connects.clone();
+        move |request: ConnectRequest<MySql>, next: ConnectNext<MySql>| {
+            connects.lock().unwrap().push(request.connection_info());
+            next.run(request.map_options(|options| options.timezone(Some("+01:00".into()))))
+        }
+    }));
+
+    let mut conn = MySqlConnection::connect_with(&layered).await?;
+    let timezone: String = sqlx::query_scalar("SELECT @@session.time_zone")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(timezone, "+01:00");
+    conn.close().await?;
+
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect_with(layered)
+        .await?;
+    let a = pool.acquire().await?;
+    let b = pool.acquire().await?;
+    drop((a, b));
+    pool.close().await;
+
+    let connects = std::mem::take(&mut *connects.lock().unwrap());
+    assert_eq!(connects.len(), 3, "{connects:?}");
+
+    for info in &connects {
+        assert_eq!(info.database.as_deref(), options.get_database());
+        assert_eq!(info.user.as_deref(), Some(options.get_username()));
+        assert_eq!(info.server_address.as_deref(), Some(options.get_host()));
+        assert_eq!(info.server_port, Some(options.get_port()));
+    }
+
+    // Errors from connecting are returned unchanged.
+    let err = MySqlConnection::connect_with(&options.connect_layer(middleware::connect_fn(
+        |request: ConnectRequest<MySql>, next: ConnectNext<MySql>| {
+            next.run(
+                request.map_options(|options| options.database("sqlx_middleware_does_not_exist")),
+            )
+        },
+    )))
+    .await
+    .unwrap_err();
+    assert!(err.as_database_error().is_some(), "{err:?}");
+
+    Ok(())
+}

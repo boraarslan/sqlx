@@ -12,7 +12,7 @@ use sync_wrapper::SyncWrapper;
 
 use crate::database::Database;
 use crate::error::{BoxDynError, Error};
-use crate::middleware::{ConnectionInfo, Layer, Request, Response, Service};
+use crate::middleware::{ConnectRequest, ConnectionInfo, Layer, Request, Response, Service};
 
 /// Convert an error returned by middleware into [`Error`].
 ///
@@ -38,19 +38,16 @@ where
     }
 }
 
-trait ErasedService<DB: Database>: Send + 'static {
+trait ErasedService<Req, Resp>: Send + 'static {
     fn erased_poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>>;
 
-    fn erased_call(
-        &mut self,
-        request: Request<DB>,
-    ) -> BoxFuture<'static, Result<Response<DB>, Error>>;
+    fn erased_call(&mut self, request: Req) -> BoxFuture<'static, Result<Resp, Error>>;
 }
 
-impl<DB, S> ErasedService<DB> for S
+impl<Req, Resp, S> ErasedService<Req, Resp> for S
 where
-    DB: Database,
-    S: Service<Request<DB>, Response = Response<DB>> + Send + 'static,
+    Resp: 'static,
+    S: Service<Req, Response = Resp> + Send + 'static,
     S::Error: Into<BoxDynError> + 'static,
     S::Future: Send + 'static,
 {
@@ -60,16 +57,13 @@ where
     }
 
     #[inline]
-    fn erased_call(
-        &mut self,
-        request: Request<DB>,
-    ) -> BoxFuture<'static, Result<Response<DB>, Error>> {
+    fn erased_call(&mut self, request: Req) -> BoxFuture<'static, Result<Resp, Error>> {
         let mut fut = Some(Service::call(self, request));
 
         // Avoid boxing the future again if it's already the right type,
         // like the futures of drivers and of `BoxService` itself.
         if let Some(fut) = (&mut fut as &mut dyn Any)
-            .downcast_mut::<Option<BoxFuture<'static, Result<Response<DB>, Error>>>>()
+            .downcast_mut::<Option<BoxFuture<'static, Result<Resp, Error>>>>()
         {
             return fut.take().expect("BUG: future already taken");
         }
@@ -79,76 +73,35 @@ where
     }
 }
 
-/// A type-erased middleware service.
+/// A type-erased service whose clones share one instance of it, which is locked from when
+/// `poll_ready()` returns `Ready` until `call()` returns.
 ///
-/// Used as the inner service of layers added with [`ConnectOptions::layer()`] and
-/// [`PoolOptions::layer()`], and as the type-erased result of applying them.
-///
-/// `BoxService` is `Clone + Send + Sync`, but the wrapped service only needs to be `Send`:
-/// clones share the same instance of the wrapped service, so stateful middleware (like a rate
-/// limit) applies to all clones. This allows using middleware which needs to clone its inner
-/// service, like `tower::retry::Retry`.
-///
-/// The shared instance is locked from when [`poll_ready()`][Service::poll_ready] returns
-/// `Ready` until [`call()`][Service::call] returns the response future. This lock is uncontended
-/// unless clones are used concurrently.
-///
-/// [`ConnectOptions::layer()`]: crate::connection::ConnectOptions::layer
-/// [`PoolOptions::layer()`]: crate::pool::PoolOptions::layer
-pub struct BoxService<DB: Database> {
-    shared: Arc<Mutex<Box<dyn ErasedService<DB>>>>,
-    state: SyncWrapper<State<DB>>,
+/// The common implementation of [`BoxService`] and [`BoxConnectService`].
+struct SharedService<Req, Resp> {
+    shared: Arc<Mutex<Box<dyn ErasedService<Req, Resp>>>>,
+    state: SyncWrapper<State<Req, Resp>>,
 }
 
-enum State<DB: Database> {
+enum State<Req, Resp> {
     Idle,
-    Locking(Pin<Box<LockArc<Box<dyn ErasedService<DB>>>>>),
-    Locked(MutexGuardArc<Box<dyn ErasedService<DB>>>),
+    Locking(Pin<Box<LockArc<Box<dyn ErasedService<Req, Resp>>>>>),
+    Locked(MutexGuardArc<Box<dyn ErasedService<Req, Resp>>>),
 }
 
-impl<DB: Database> BoxService<DB> {
-    /// Erase the type of `service`.
-    ///
-    /// Errors returned by the service are converted with [`into_sqlx_error()`].
-    ///
-    /// If `service` is already a `BoxService`, it's returned as-is.
-    pub fn new<S>(service: S) -> Self
+impl<Req: 'static, Resp: Send + 'static> SharedService<Req, Resp> {
+    fn new<S>(service: S) -> Self
     where
-        S: Service<Request<DB>, Response = Response<DB>> + Send + 'static,
+        S: Service<Req, Response = Resp> + Send + 'static,
         S::Error: Into<BoxDynError> + 'static,
         S::Future: Send + 'static,
     {
-        let mut service = Some(service);
-
-        if let Some(boxed) = (&mut service as &mut dyn Any).downcast_mut::<Option<Self>>() {
-            return boxed.take().expect("BUG: service already taken");
-        }
-
         Self {
-            shared: Arc::new(Mutex::new(Box::new(
-                service.take().expect("BUG: service already taken"),
-            ))),
+            shared: Arc::new(Mutex::new(Box::new(service))),
             state: SyncWrapper::new(State::Idle),
         }
     }
-}
 
-impl<DB: Database> Clone for BoxService<DB> {
-    /// Create another handle to the same service. The new handle is not ready.
-    fn clone(&self) -> Self {
-        Self {
-            shared: self.shared.clone(),
-            state: SyncWrapper::new(State::Idle),
-        }
-    }
-}
-
-impl<DB: Database> Service<Request<DB>> for BoxService<DB> {
-    type Response = Response<DB>;
-    type Error = Error;
-    type Future = BoxFuture<'static, Result<Response<DB>, Error>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let state = self.state.get_mut();
 
         loop {
@@ -177,20 +130,169 @@ impl<DB: Database> Service<Request<DB>> for BoxService<DB> {
         }
     }
 
-    fn call(&mut self, request: Request<DB>) -> Self::Future {
+    fn call(&mut self, request: Req, type_name: &str) -> BoxFuture<'static, Result<Resp, Error>> {
         match std::mem::replace(self.state.get_mut(), State::Idle) {
             // The service is unlocked as soon as it returns the response future.
             State::Locked(mut service) => service.erased_call(request),
             _ => Box::pin(future::ready(Err(Error::Middleware(
-                "BUG: `BoxService::call()` invoked before `poll_ready()` returned `Ready`".into(),
+                format!(
+                    "BUG: `{type_name}::call()` invoked before `poll_ready()` returned `Ready`"
+                )
+                .into(),
             )))),
         }
+    }
+}
+
+impl<Req, Resp> Clone for SharedService<Req, Resp> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            state: SyncWrapper::new(State::Idle),
+        }
+    }
+}
+
+/// A type-erased middleware service.
+///
+/// Used as the inner service of layers added with [`ConnectOptions::layer()`] and
+/// [`PoolOptions::layer()`], and as the type-erased result of applying them.
+///
+/// `BoxService` is `Clone + Send + Sync`, but the wrapped service only needs to be `Send`:
+/// clones share the same instance of the wrapped service, so stateful middleware (like a rate
+/// limit) applies to all clones. This allows using middleware which needs to clone its inner
+/// service, like `tower::retry::Retry`.
+///
+/// The shared instance is locked from when [`poll_ready()`][Service::poll_ready] returns
+/// `Ready` until [`call()`][Service::call] returns the response future. This lock is uncontended
+/// unless clones are used concurrently.
+///
+/// [`ConnectOptions::layer()`]: crate::connection::ConnectOptions::layer
+/// [`PoolOptions::layer()`]: crate::pool::PoolOptions::layer
+pub struct BoxService<DB: Database> {
+    inner: SharedService<Request<DB>, Response<DB>>,
+}
+
+impl<DB: Database> BoxService<DB> {
+    /// Erase the type of `service`.
+    ///
+    /// Errors returned by the service are converted with [`into_sqlx_error()`].
+    ///
+    /// If `service` is already a `BoxService`, it's returned as-is.
+    pub fn new<S>(service: S) -> Self
+    where
+        S: Service<Request<DB>, Response = Response<DB>> + Send + 'static,
+        S::Error: Into<BoxDynError> + 'static,
+        S::Future: Send + 'static,
+    {
+        let mut service = Some(service);
+
+        if let Some(boxed) = (&mut service as &mut dyn Any).downcast_mut::<Option<Self>>() {
+            return boxed.take().expect("BUG: service already taken");
+        }
+
+        Self {
+            inner: SharedService::new(service.take().expect("BUG: service already taken")),
+        }
+    }
+}
+
+impl<DB: Database> Clone for BoxService<DB> {
+    /// Create another handle to the same service. The new handle is not ready.
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<DB: Database> Service<Request<DB>> for BoxService<DB> {
+    type Response = Response<DB>;
+    type Error = Error;
+    type Future = BoxFuture<'static, Result<Response<DB>, Error>>;
+
+    #[inline]
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    #[inline]
+    fn call(&mut self, request: Request<DB>) -> Self::Future {
+        self.inner.call(request, "BoxService")
     }
 }
 
 impl<DB: Database> Debug for BoxService<DB> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("BoxService").finish_non_exhaustive()
+    }
+}
+
+/// A type-erased connect middleware service.
+///
+/// Used as the inner service of layers added with [`ConnectOptions::connect_layer()`],
+/// and as the type-erased result of applying them.
+///
+/// Like [`BoxService`], it's `Clone + Send + Sync`, and its clones share the same instance of
+/// the wrapped service.
+///
+/// [`ConnectOptions::connect_layer()`]: crate::connection::ConnectOptions::connect_layer
+pub struct BoxConnectService<DB: Database> {
+    inner: SharedService<ConnectRequest<DB>, DB::Connection>,
+}
+
+impl<DB: Database> BoxConnectService<DB> {
+    /// Erase the type of `service`.
+    ///
+    /// Errors returned by the service are converted with [`into_sqlx_error()`].
+    ///
+    /// If `service` is already a `BoxConnectService`, it's returned as-is.
+    pub fn new<S>(service: S) -> Self
+    where
+        S: Service<ConnectRequest<DB>, Response = DB::Connection> + Send + 'static,
+        S::Error: Into<BoxDynError> + 'static,
+        S::Future: Send + 'static,
+    {
+        let mut service = Some(service);
+
+        if let Some(boxed) = (&mut service as &mut dyn Any).downcast_mut::<Option<Self>>() {
+            return boxed.take().expect("BUG: service already taken");
+        }
+
+        Self {
+            inner: SharedService::new(service.take().expect("BUG: service already taken")),
+        }
+    }
+}
+
+impl<DB: Database> Clone for BoxConnectService<DB> {
+    /// Create another handle to the same service. The new handle is not ready.
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<DB: Database> Service<ConnectRequest<DB>> for BoxConnectService<DB> {
+    type Response = DB::Connection;
+    type Error = Error;
+    type Future = BoxFuture<'static, Result<DB::Connection, Error>>;
+
+    #[inline]
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    #[inline]
+    fn call(&mut self, request: ConnectRequest<DB>) -> Self::Future {
+        self.inner.call(request, "BoxConnectService")
+    }
+}
+
+impl<DB: Database> Debug for BoxConnectService<DB> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BoxConnectService").finish_non_exhaustive()
     }
 }
 
