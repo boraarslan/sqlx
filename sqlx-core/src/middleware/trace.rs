@@ -51,8 +51,17 @@ use crate::middleware::{
 ///
 /// The `otel.*` fields are special fields interpreted by `tracing-opentelemetry`.
 ///
-/// When exported to Datadog through OpenTelemetry, these attributes are mapped to Datadog's
-/// conventions for SQL spans (`span.type = sql`, with the query text as the resource name).
+/// # Legacy Attributes and Datadog
+/// The names above are those of the stable OpenTelemetry conventions. Some backends still expect
+/// the names used before they were stabilized: with
+/// [`legacy_attributes(true)`][Self::legacy_attributes], spans also have the fields
+/// `db.system` (same as `db.system.name`), `db.statement` (same as `db.query.text`) and
+/// `db.name` (same as `db.namespace`), like the `database/dup` mode of other OpenTelemetry
+/// instrumentations.
+///
+/// Datadog [documents][datadog] `db.system` and `db.statement` as the attributes which make an
+/// OpenTelemetry span a SQL span (`span.type = sql`) with the normalized query as its resource
+/// name, so enable `legacy_attributes` when exporting to Datadog.
 ///
 /// # Connecting
 /// `TraceLayer` can also be added with [`ConnectOptions::connect_layer()`] to create a span for
@@ -81,23 +90,39 @@ use crate::middleware::{
 /// ```
 ///
 /// [otel]: https://opentelemetry.io/docs/specs/semconv/database/database-spans/
+/// [datadog]: https://docs.datadoghq.com/opentelemetry/correlate/dbm_and_traces/
 #[derive(Clone, Debug)]
 pub struct TraceLayer {
     query_text: bool,
+    legacy_attributes: bool,
 }
 
 impl TraceLayer {
     /// Create a layer with the default configuration.
     pub fn new() -> Self {
-        Self { query_text: true }
+        Self {
+            query_text: true,
+            legacy_attributes: false,
+        }
     }
 
-    /// Set whether to record the SQL of each request in the `db.query.text` field.
+    /// Set whether to record the SQL of each request in the `db.query.text` field
+    /// (and `db.statement`, with [`legacy_attributes(true)`][Self::legacy_attributes]).
     ///
     /// Defaults to `true`, as recommended by the OpenTelemetry conventions for parameterized
     /// queries. Disable this if your queries may contain sensitive literal values.
     pub fn query_text(mut self, enabled: bool) -> Self {
         self.query_text = enabled;
+        self
+    }
+
+    /// Set whether to also record the attribute names used before the OpenTelemetry database
+    /// conventions were stabilized: `db.system`, `db.statement` and `db.name`.
+    ///
+    /// Defaults to `false`. Enable this when exporting to Datadog; see the
+    /// [type-level documentation](Self#legacy-attributes-and-datadog).
+    pub fn legacy_attributes(mut self, enabled: bool) -> Self {
+        self.legacy_attributes = enabled;
         self
     }
 }
@@ -115,6 +140,7 @@ impl<S> Layer<S> for TraceLayer {
         Trace {
             inner,
             query_text: self.query_text,
+            legacy_attributes: self.legacy_attributes,
         }
     }
 }
@@ -154,12 +180,14 @@ impl QuerySummary {
 pub struct Trace<S> {
     inner: S,
     query_text: bool,
+    legacy_attributes: bool,
 }
 
 impl<S> Debug for Trace<S> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Trace")
             .field("query_text", &self.query_text)
+            .field("legacy_attributes", &self.legacy_attributes)
             .finish_non_exhaustive()
     }
 }
@@ -181,7 +209,7 @@ where
     }
 
     fn call(&mut self, request: Request<DB>) -> Self::Future {
-        let span = request_span(&request, self.query_text);
+        let span = request_span(&request, self.query_text, self.legacy_attributes);
         let response = self.inner.call(request).instrument(span.clone());
 
         Box::pin(async move {
@@ -220,7 +248,7 @@ where
     }
 
     fn call(&mut self, request: ConnectRequest<DB>) -> Self::Future {
-        let span = connect_span(&request);
+        let span = connect_span(&request, self.legacy_attributes);
         let response = self.inner.call(request).instrument(span.clone());
 
         Box::pin(async move {
@@ -232,7 +260,7 @@ where
     }
 }
 
-fn connect_span<DB: Database>(request: &ConnectRequest<DB>) -> Span {
+fn connect_span<DB: Database>(request: &ConnectRequest<DB>, legacy_attributes: bool) -> Span {
     let system = system_name::<DB>();
 
     let span = tracing::info_span!(
@@ -248,18 +276,28 @@ fn connect_span<DB: Database>(request: &ConnectRequest<DB>) -> Span {
         error.type = Empty,
         server.address = Empty,
         server.port = Empty,
+        db.system = Empty,
+        db.name = Empty,
     );
 
     if !span.is_disabled() {
-        record_connection_info(&span, &request.connection_info());
+        if legacy_attributes {
+            span.record("db.system", &*system);
+        }
+
+        record_connection_info(&span, &request.connection_info(), legacy_attributes);
     }
 
     span
 }
 
-fn record_connection_info(span: &Span, info: &ConnectionInfo) {
+fn record_connection_info(span: &Span, info: &ConnectionInfo, legacy_attributes: bool) {
     if let Some(database) = &info.database {
         span.record("db.namespace", database.as_str());
+
+        if legacy_attributes {
+            span.record("db.name", database.as_str());
+        }
     }
 
     if let Some(address) = &info.server_address {
@@ -271,7 +309,11 @@ fn record_connection_info(span: &Span, info: &ConnectionInfo) {
     }
 }
 
-fn request_span<DB: Database>(request: &Request<DB>, query_text: bool) -> Span {
+fn request_span<DB: Database>(
+    request: &Request<DB>,
+    query_text: bool,
+    legacy_attributes: bool,
+) -> Span {
     let system = system_name::<DB>();
     let summary = request
         .extensions()
@@ -295,18 +337,29 @@ fn request_span<DB: Database>(request: &Request<DB>, query_text: bool) -> Span {
         server.address = Empty,
         server.port = Empty,
         sqlx.request.kind = request.kind().as_str(),
+        db.system = Empty,
+        db.statement = Empty,
+        db.name = Empty,
     );
 
     if span.is_disabled() {
         return span;
     }
 
+    if legacy_attributes {
+        span.record("db.system", &*system);
+    }
+
     if query_text {
         span.record("db.query.text", request.sql().as_str());
+
+        if legacy_attributes {
+            span.record("db.statement", request.sql().as_str());
+        }
     }
 
     if let Some(info) = request.connection_info() {
-        record_connection_info(&span, info);
+        record_connection_info(&span, info, legacy_attributes);
     }
 
     span

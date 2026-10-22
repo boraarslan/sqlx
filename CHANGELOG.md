@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * `middleware::from_fn()` creates middleware from an async closure.
   * `middleware::trace::TraceLayer` creates a `tracing` span per request following the OpenTelemetry semantic
     conventions for database client spans (`db.system.name`, `db.query.text`, `db.namespace`, ...).
+    `legacy_attributes(true)` also records the pre-stable names (`db.system`, `db.statement`, `db.name`), which
+    Datadog uses to identify SQL spans.
   * `Query::extension()` (and on `QueryAs`, `QueryScalar` and `Map`) attaches values to the request for middleware.
   * `Request::connection_info()` describes the database a request is sent to (from the new
     `ConnectOptions::connection_info()`), and `Request::transaction_depth()` the transaction state of the connection.

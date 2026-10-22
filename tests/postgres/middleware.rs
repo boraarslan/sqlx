@@ -1090,3 +1090,48 @@ async fn it_traces_connects() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[sqlx_macros::test]
+async fn it_traces_with_legacy_attributes() -> anyhow::Result<()> {
+    use sqlx::middleware::trace::TraceLayer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let capture = span_capture::SpanCapture::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+
+    let options = connect_options()?;
+
+    for legacy in [false, true] {
+        let layer = TraceLayer::new().legacy_attributes(legacy);
+        let mut conn =
+            PgConnection::connect_with(&options.clone().layer(layer.clone()).connect_layer(layer))
+                .await?;
+        conn.execute("SELECT 1").await?;
+        conn.close().await?;
+    }
+
+    let spans = std::mem::take(&mut *capture.0.lock().unwrap());
+    let names: Vec<_> = spans.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        names,
+        ["sqlx.connect", "sqlx.query", "sqlx.connect", "sqlx.query"]
+    );
+
+    for (_, fields) in &spans[..2] {
+        assert!(!fields.contains_key("db.system"), "{fields:?}");
+        assert!(!fields.contains_key("db.statement"), "{fields:?}");
+        assert!(!fields.contains_key("db.name"), "{fields:?}");
+    }
+
+    for (_, fields) in &spans[2..] {
+        assert_eq!(fields["db.system"], "postgresql");
+        assert_eq!(fields.get("db.name"), fields.get("db.namespace"));
+    }
+
+    assert!(!spans[2].1.contains_key("db.statement"));
+    assert_eq!(spans[3].1["db.statement"], "SELECT 1");
+    assert_eq!(spans[3].1["db.query.text"], "SELECT 1");
+
+    Ok(())
+}
